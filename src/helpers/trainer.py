@@ -9,6 +9,8 @@ from transformers import (
     Trainer,
     DataCollatorForTokenClassification,
 )
+from src.helpers.callbacks import MongoTrainLogger
+import os
 
 def prepare_dataset(examples, label_names):
     tok = CamembertTokenizerFast.from_pretrained("camembert-base")
@@ -127,6 +129,11 @@ def trainer(dataset, model, *, parameters=None, eval_dataset=None):
         data_collator=collator,
         compute_metrics=(None if eval_dataset is None else (lambda p: compute_metrics(p, id2label))),
     )
+
+    mongo_uri = os.getenv("MONGO_URI")
+    did = dataset[0].get("dataset")
+    tr.add_callback(MongoTrainLogger(mongo_uri=mongo_uri, dataset=did, model=model, version=mversion))
+
     tr.train()
     tr.save_model(out_dir)
     tok.save_pretrained(out_dir)
