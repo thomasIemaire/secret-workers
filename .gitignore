@@ -1,0 +1,8 @@
+venv/
+.venv/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.env
+src/models/
