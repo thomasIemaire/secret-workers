@@ -80,7 +80,7 @@ def compute_metrics(eval_pred, id2label):
 def trainer(dataset, model, *, parameters=None, eval_dataset=None):
     parameters = parameters or {}
     label_names = model.get("labels", [])
-    mname = model.get("name", "model")
+    mref = model.get("reference", "model")
     mversion = model.get("version", "1.0")
     train_ds, label2id, id2label = prepare_dataset(dataset, label_names)
     ner_model = CamembertForTokenClassification.from_pretrained(
@@ -94,7 +94,7 @@ def trainer(dataset, model, *, parameters=None, eval_dataset=None):
     use_fp16 = bool(parameters.get("fp16", False)) and torch.cuda.is_available()
     if parameters.get("fp16", False) and not torch.cuda.is_available():
         print("[trainer] fp16 demandé mais CUDA indisponible -> on désactive.", flush=True)
-    out_dir = f"./src/models/{mname}/{mversion}"
+    out_dir = f"./src/models/{mref}/{mversion}"
     args = TrainingArguments(
         output_dir=out_dir,
         learning_rate=parameters.get("learning_rate", 5e-5),
@@ -103,7 +103,7 @@ def trainer(dataset, model, *, parameters=None, eval_dataset=None):
         weight_decay=parameters.get("weight_decay", 0.01),
         save_strategy="epoch",
         evaluation_strategy=("no" if eval_dataset is None else parameters.get("eval_strategy", "epoch")),
-        logging_dir=f"./logs/{mname}/{mversion}",
+        logging_dir=f"./logs/{mref}/{mversion}",
         logging_steps=10,
         fp16=use_fp16,
         gradient_accumulation_steps=parameters.get("grad_accum", 1),
