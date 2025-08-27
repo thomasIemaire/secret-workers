@@ -40,13 +40,14 @@ def run_task(doc: dict):
         model = col_models.find_one({"_id": ObjectId(model_id)})
         if not model:
             raise ValueError(f"modèle introuvable: {model_id}")
+        
         version = doc.get("version", "1.0")
         params = doc.get("parameters", {})
 
         col_tasks.update_one({"_id": doc["_id"]}, {"$set": {"status": "running", "started_at": datetime.utcnow()}})
         print(f"[{jid}] start training… model={model.get('name')} v={version} | items={len(dataset)}", flush=True)
 
-        run_trainer(dataset, model, parameters=params)
+        run_trainer(dataset, model, parameters=params, version=version)
 
         col_tasks.update_one({"_id": doc["_id"]}, {"$set": {"status": "completed", "finished_at": datetime.utcnow()}})
         print(f"[{jid}] done ✅", flush=True)

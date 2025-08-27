@@ -79,11 +79,11 @@ def compute_metrics(eval_pred, id2label):
     metric = evaluate.load("seqeval")
     return metric.compute(predictions=true_preds, references=true_labels)
 
-def trainer(dataset, model, *, parameters=None, eval_dataset=None):
+def trainer(dataset, model, *, parameters=None, eval_dataset=None, version=None):
     parameters = parameters or {}
     label_names = model.get("labels", [])
     mref = model.get("reference", "model")
-    mversion = model.get("version", "1.0")
+    mversion = version or model.get("version", "1.0")
     train_ds, label2id, id2label = prepare_dataset(dataset, label_names)
     ner_model = CamembertForTokenClassification.from_pretrained(
         "camembert-base",
@@ -96,7 +96,7 @@ def trainer(dataset, model, *, parameters=None, eval_dataset=None):
     use_fp16 = bool(parameters.get("fp16", False)) and torch.cuda.is_available()
     if parameters.get("fp16", False) and not torch.cuda.is_available():
         print("[trainer] fp16 demandé mais CUDA indisponible -> on désactive.", flush=True)
-    out_dir = f"./src/models/{mref}/{mversion}"
+    out_dir = f"./../sardine.agents/{mref}/{mversion}"
     args = TrainingArguments(
         output_dir=out_dir,
         learning_rate=parameters.get("learning_rate", 5e-5),
