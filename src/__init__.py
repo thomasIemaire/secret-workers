@@ -17,6 +17,7 @@ db = client.get_database()
 col_tasks = db.get_collection("datasets")
 col_data = db.get_collection("datasets_data")
 col_models = db.get_collection("models")
+col_agents = db.get_collection("agents")
 
 from src.helpers.trainer import trainer as run_trainer
 
@@ -44,21 +45,34 @@ def run_task(doc: dict):
         version = doc.get("version", "1.0")
         params = doc.get("parameters", {})
 
-        col_tasks.update_one({"_id": doc["_id"]}, {"$set": {"status": "running", "started_at": datetime.utcnow()}})
+        col_tasks.update_one({"_id": doc["_id"]}, {"$set": {"status": "training", "started_at": datetime.utcnow()}})
         print(f"[{jid}] start training… model={model.get('name')} v={version} | items={len(dataset)}", flush=True)
 
         run_trainer(dataset, model, parameters=params, version=version)
 
         col_tasks.update_one({"_id": doc["_id"]}, {"$set": {"status": "completed", "finished_at": datetime.utcnow()}})
+
+        create_agent(model_id, version, f"sardine.agents/{model.get('reference')}/{version}", created_by=doc.get("created_by"))
+
         print(f"[{jid}] done ✅", flush=True)
     except Exception as e:
         err = "".join(traceback.format_exception_only(type(e), e)).strip()
         col_tasks.update_one({"_id": doc["_id"]}, {"$set": {"status": "failed", "error": err, "finished_at": datetime.utcnow()}})
         print(f"[{jid}] failed ❌ {err}", flush=True)
 
-def claim_one_pending():
+def create_agent(model_id: str, version: str, path: str, *, created_by=None):
+    col_agents.insert_one({
+        "created_by": created_by,
+        "created_at": datetime.utcnow(),
+        "model": ObjectId(model_id),
+        "version": version,
+        "path": path,
+        "status": "enabled",
+    })
+
+def claim_one_ready():
     doc = col_tasks.find_one_and_update(
-        {"status": "pending"},
+        {"status": "ready"},
         {"$set": {"status": "claimed", "claimed_at": datetime.utcnow()}},
         sort=[("created_at", 1)],
         return_document=ReturnDocument.AFTER,
@@ -74,7 +88,7 @@ def main():
         while not stop_event.is_set():
             futures = {f for f in futures if not f.done()}
             while not stop_event.is_set() and len(futures) < MAX_WORKERS:
-                task = claim_one_pending()
+                task = claim_one_ready()
                 if not task:
                     break
                 futures.add(executor.submit(run_task, task))

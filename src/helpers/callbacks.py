@@ -52,10 +52,6 @@ class MongoTrainLogger(TrainerCallback):
         self.col_jobs.update_one(
             {"_id": ObjectId(self.dataset)},
             {"$set": {
-                "train_runtime": state.train_runtime,
-                "train_samples_per_second": state.train_samples_per_second,
-                "train_steps_per_second": state.train_steps_per_second,
-                "train_loss": state.best_metric if state.best_metric is not None else None,
                 "finished_at": datetime.utcnow(),
             }}
         )
