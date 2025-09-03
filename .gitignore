@@ -5,4 +5,3 @@ venv/
 *$py.class
 *.pyc
 .env
-src/models/
