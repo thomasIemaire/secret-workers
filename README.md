@@ -8,6 +8,6 @@ ou
 
 mkdir -p /data/tmp /data/pip-cache
 
-# utilise le gros disque pour les fichiers temporaires et le cache
+utilise le gros disque pour les fichiers temporaires et le cache
 env TMPDIR=/data/tmp PIP_CACHE_DIR=/data/pip-cache \
     pip install --no-cache-dir -r requirements.txt
