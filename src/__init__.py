@@ -39,8 +39,8 @@ def main():
     workers = [
         Worker(
             "builder",
-            lambda: claim_one_status("empty", "generating"),  # une fonction sans argument
-            run_builder,                                      # NE PAS l’appeler ici
+            lambda: claim_one_status("empty", "generating"),
+            run_builder,
             MAX_WORKERS_BUILDER,
             POLL_DELAY,
             stop_event,
