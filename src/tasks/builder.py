@@ -155,6 +155,7 @@ def build_model_configuration_value(
             if config_id:
                 config = context_db.get_collection("models_configurations").find_one({"_id": ObjectId(config_id)})
                 value = build_model_configuration(config)
+                return value.get("format", ""), config.get("attributes", [])
     
     if value is None: return None, None
         
