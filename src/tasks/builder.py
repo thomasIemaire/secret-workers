@@ -106,9 +106,6 @@ def build_model_configuration(
         kattr = attr.get("key")
         fattr = attr.get("frequency", 1)
         rattr = attr.get("requirements", [])
-
-        print(kattr)
-
         vattr = attr.get("value") if fattr > random.random() else False
 
         if isinstance(vattr, dict):
@@ -126,8 +123,6 @@ def build_model_configuration(
             "value": bvattr if vattr else '',
             "requirements": build_model_configuration_requirements(bvattr, rattr) if vattr else True
         })
-
-        print(satt[-1])
 
     bfmt = build_model_configuration_format(sfmt, satt)
     configuration['attributes'] = satt
@@ -266,8 +261,6 @@ def build_model_entity(
         kattr = attr.get("key")
         vattr = attr.get("value", "")
         rattr = attr.get("requirements", True)
-
-        print("ENTITY : ", kattr)
 
         if not kattr in keys or \
             vattr == '' or not rattr:
