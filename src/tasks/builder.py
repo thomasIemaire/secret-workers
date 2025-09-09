@@ -93,7 +93,9 @@ def model_build_calculate_size(
         case _:
             return int(1e3)
 
-def build_model_configuration(configuration: dict) -> dict:
+def build_model_configuration(
+        configuration: dict
+    ) -> dict:
     catt = configuration.get("attributes")
     cfmt = configuration.get("formats")
 
@@ -104,6 +106,8 @@ def build_model_configuration(configuration: dict) -> dict:
         kattr = attr.get("key")
         fattr = attr.get("frequency", 1)
         rattr = attr.get("requirements", [])
+
+        print(kattr)
 
         vattr = attr.get("value") if fattr > random.random() else False
 
@@ -122,6 +126,8 @@ def build_model_configuration(configuration: dict) -> dict:
             "value": bvattr if vattr else '',
             "requirements": build_model_configuration_requirements(bvattr, rattr) if vattr else True
         })
+
+        print(satt[-1])
 
     bfmt = build_model_configuration_format(sfmt, satt)
     configuration['attributes'] = satt
