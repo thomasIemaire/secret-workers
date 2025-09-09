@@ -21,7 +21,7 @@ def run_task(*, doc: dict= None, db=None, MAX_WORKERS=2) -> dict:
 
     mversion = model.get("version", "1.0")
     ments = model.get("entities", {})
-    mkeys = list(ments.values())
+    mkeys = list(ments.keys())
 
     mcid = model.get("configuration", None)
     if not mcid:
