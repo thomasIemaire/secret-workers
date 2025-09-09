@@ -267,6 +267,8 @@ def build_model_entity(
         vattr = attr.get("value", "")
         rattr = attr.get("requirements", True)
 
+        print("ENTITY : ", kattr)
+
         if not kattr in keys or \
             vattr == '' or not rattr:
             continue
