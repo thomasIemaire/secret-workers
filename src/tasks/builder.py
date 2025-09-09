@@ -21,7 +21,7 @@ def run_task(*, doc: dict= None, db=None, MAX_WORKERS=2) -> dict:
 
     mversion = model.get("version", "1.0")
     ments = model.get("entities", {})
-    mkeys = list(ments.values())
+    mkeys = list(ments.keys())
 
     mcid = model.get("configuration", None)
     if not mcid:
@@ -54,8 +54,7 @@ def run_task(*, doc: dict= None, db=None, MAX_WORKERS=2) -> dict:
         dataset.append(
             build_model_entity(
                 mvb,
-                mkeys,
-                {v:k for k,v in ments.items()}
+                mkeys
             )
         )
 
@@ -253,7 +252,6 @@ def build_model_configuration_randomizers(
 def build_model_entity(
     configuration: dict,
     keys: list[str],
-    map: dict
 ) -> dict:
     vfmt = configuration.get("format", "")
     ents = []
@@ -263,19 +261,16 @@ def build_model_entity(
         vattr = attr.get("value", "")
         rattr = attr.get("requirements", True)
 
-
         if not kattr in keys or \
             vattr == '' or not rattr:
             continue
-
-        enttok = map.get(kattr)
 
         strvattr = str(vattr)
         sta = vfmt.lower().find(strvattr.lower()) if vattr else -1
         if sta == -1: continue
         end = sta + len(strvattr)
 
-        ents.append([sta, end, enttok])
+        ents.append([sta, end, kattr])
     
     return { "text": vfmt, "entities": ents }
 
