@@ -213,9 +213,11 @@ def build_model_configuration_requirements(
                         return False
                 except: pass
             case "in":
+                creq  = [x.strip() for x in creq.split(",")] if isinstance(creq, str) else creq
                 if str(value) not in map(str, creq):
                     return False
             case "nin":
+                creq  = [x.strip() for x in creq.split(",")] if isinstance(creq, str) else creq
                 if str(value) in map(str, creq):
                     return False
             case _:
