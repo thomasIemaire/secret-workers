@@ -276,15 +276,14 @@ def build_model_entity(
             vattr == '' or not rattr:
             continue
 
-        strvattr = f"{{{kattr}:{vattr}}}"
+        strvattr = f"{{{kattr}:{vattr}}}" #
         # strvattr = str(vattr)
 
         sta = vfmt.lower().find(strvattr.lower()) if vattr else -1
+        vfmt = vfmt.replace(strvattr, str(vattr)) #
         if sta == -1: continue
         # end = sta + len(strvattr)
-        end = sta + len(vattr)
-
-        vfmt = vfmt.replace(strvattr, str(vattr))
+        end = sta + len(vattr) #
 
         ents.append([sta, end, kattr])
     
