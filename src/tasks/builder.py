@@ -267,7 +267,8 @@ def build_model_entity(
     vfmt = configuration.get("format", "")
     ents = []
 
-    replaced = [] #
+    replaced = []
+    in_replaced = []
 
     for attr in configuration.get("attributes", []):
         kattr = attr.get("key")
@@ -280,14 +281,15 @@ def build_model_entity(
             vattr == '' or not rattr:
             continue_f = False
 
+        for r in replaced:
+            if r['format'] in vattr:
+                vattr = vattr.replace(r['format'], r['value'])
+                in_replaced.append({"ikey": r["key"], "key": kattr}) 
+
         strvattr = f"{{{kattr}:{vattr}}}" #
-
-        for rstrvattr, rvattr in replaced:
-            if rstrvattr in strvattr:
-                strvattr = strvattr.replace(rstrvattr, rvattr) #
-
-        replaced.append((strvattr, vattr))
         # strvattr = str(vattr)
+
+        replaced.append({"format": strvattr, "value": vattr, "key": kattr})
 
         sta = vfmt.lower().find(strvattr.lower()) if vattr else -1
         vfmt = vfmt.replace(strvattr, str(vattr)) #
@@ -296,6 +298,13 @@ def build_model_entity(
         end = sta + len(vattr) #
 
         ents.append([sta, end, kattr])
+
+    for ir in in_replaced:
+        for n in range(len(ents)):
+            st, ed, ke = ents[n]
+            if ir["ikey"] == ke:
+                ents[n][0] = st - len(ir["key"]) - 2
+                ents[n][1] = ed - len(ir["key"]) - 2
     
     return { "text": vfmt, "entities": ents }
 
