@@ -238,7 +238,8 @@ def build_model_configuration_format(
     for attr in attributes:
         kattr = attr.get("key")
         vattr = attr.get("value", "")
-        format = format.replace(f"{{{kattr}}}", str(vattr))
+        # format = format.replace(f"{{{kattr}}}", str(vattr))
+        format = format.replace(f"{{{kattr}}}", f"{{{kattr}:{vattr}}}")
     return format
 
 def build_model_configuration_randomizers(
@@ -275,10 +276,15 @@ def build_model_entity(
             vattr == '' or not rattr:
             continue
 
-        strvattr = str(vattr)
+        strvattr = f"{{{kattr}:{vattr}}}"
+        # strvattr = str(vattr)
+
         sta = vfmt.lower().find(strvattr.lower()) if vattr else -1
         if sta == -1: continue
-        end = sta + len(strvattr)
+        # end = sta + len(strvattr)
+        end = sta + len(vattr)
+
+        vfmt = vfmt.replace(strvattr, str(vattr))
 
         ents.append([sta, end, kattr])
     
