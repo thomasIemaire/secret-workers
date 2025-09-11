@@ -35,6 +35,8 @@ def run_task(*, doc: dict=None, db=None, MAX_WORKERS=2):
 
         run_trainer(dataset, model, parameters=params, version=version)
 
+        col_data.delete_many({"dataset": ObjectId(doc["_id"])})
+
         col_tasks.update_one({"_id": doc["_id"]}, {"$set": {"status": "completed", "finished_at": datetime.utcnow()}})
 
         col_agents.insert_one({
