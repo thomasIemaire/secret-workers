@@ -272,16 +272,18 @@ def build_model_entity(
         vattr = attr.get("value", "")
         rattr = attr.get("requirements", True)
 
+        continue_f = True
+
         if not kattr in keys or \
             vattr == '' or not rattr:
-            continue
+            continue_f = False
 
         strvattr = f"{{{kattr}:{vattr}}}" #
         # strvattr = str(vattr)
 
         sta = vfmt.lower().find(strvattr.lower()) if vattr else -1
         vfmt = vfmt.replace(strvattr, str(vattr)) #
-        if sta == -1: continue
+        if sta == -1 or not continue_f: continue
         # end = sta + len(strvattr)
         end = sta + len(vattr) #
 
