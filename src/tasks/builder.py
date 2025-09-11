@@ -220,6 +220,12 @@ def build_model_configuration_requirements(
                 creq  = [x.strip() for x in creq.split(",")] if isinstance(creq, str) else creq
                 if str(value) in map(str, creq):
                     return False
+            case "contains":
+                if str(creq) not in str(value):
+                    return False
+            case "ncontains":
+                if str(creq) in str(value):
+                    return False
             case _:
                 pass
                 
