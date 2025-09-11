@@ -267,6 +267,8 @@ def build_model_entity(
     vfmt = configuration.get("format", "")
     ents = []
 
+    replaced = [] #
+
     for attr in configuration.get("attributes", []):
         kattr = attr.get("key")
         vattr = attr.get("value", "")
@@ -279,6 +281,12 @@ def build_model_entity(
             continue_f = False
 
         strvattr = f"{{{kattr}:{vattr}}}" #
+
+        for rstrvattr, rvattr in replaced:
+            if rstrvattr in strvattr:
+                strvattr = strvattr.replace(rstrvattr, rvattr) #
+
+        replaced.append((strvattr, vattr))
         # strvattr = str(vattr)
 
         sta = vfmt.lower().find(strvattr.lower()) if vattr else -1
