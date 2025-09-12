@@ -276,7 +276,7 @@ def build_model_entity(
 
     for attr in configuration.get("attributes", []):
         kattr = attr.get("key")
-        vattr = attr.get("value", "")
+        vattr = str(attr.get("value", ""))
         rattr = attr.get("requirements", True)
 
         continue_f = True
