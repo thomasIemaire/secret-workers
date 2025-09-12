@@ -1,7 +1,7 @@
 from bson import ObjectId
 from datetime import datetime
 from typing import Literal, Optional
-import os, time, random, re, copy
+import os, time, random, re, copy, rstr
 
 context_db = None
 
@@ -144,6 +144,10 @@ def build_model_configuration_value(
             if vmin > vmax: vmin, vmax = vmax, vmin
             value = random.randint(vmin, vmax)
 
+        case "alphanum":
+            regex = parameters.get("regex", "")
+            value = rstr.xeger(regex)
+
         case "data":
             data_id = parameters.get("object_id")
             if data_id:
@@ -237,7 +241,7 @@ def build_model_configuration_format(
 ) -> str:
     for attr in attributes:
         kattr = attr.get("key")
-        vattr = attr.get("value", "")
+        vattr = str(attr.get("value", ""))
         # format = format.replace(f"{{{kattr}}}", str(vattr))
         format = format.replace(f"{{{kattr}}}", f"{{{kattr}:{vattr}}}")
     return format
