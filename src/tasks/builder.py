@@ -42,7 +42,7 @@ def run_task(*, doc: dict= None, db=None, MAX_WORKERS=2) -> dict:
     progress = 0
     col_tasks.update_one({"_id": ObjectId(docdtid)}, {"$set": {"status": "generating", "progress": progress}})
 
-    for _ in range(n_size):
+    for _ in range(int(n_size)):
         mvb = build_model_configuration(copy.deepcopy(configuration))
 
         try:
