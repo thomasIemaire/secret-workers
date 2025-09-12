@@ -36,3 +36,5 @@ deepmerge==1.1.1
 
 # >>> ajout critique pour corriger l'erreur
 pyarrow==12.0.1
+
+rstr==3.2.0
