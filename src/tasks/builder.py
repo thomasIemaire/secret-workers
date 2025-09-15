@@ -264,6 +264,39 @@ def build_model_configuration_randomizers(
 
     return f if frand >= random.random() else lambda x: x
 
+def get_order_entities(
+    text: str
+) -> list[str]:
+    results = []
+    stack = []
+    key = ''
+    reading_key = False
+    reading_value = False
+
+    for i, ch in enumerate(text):
+        if ch == '{':
+            reading_key = True
+            key = ''
+        elif ch == ':' and reading_key:
+            # fin de clé
+            stack.append(key)
+            reading_key = False
+            reading_value = True
+            key = ''
+        elif ch == '}':
+            if stack:
+                results.append(stack.pop())
+            reading_value = False
+        elif reading_key:
+            key += ch
+        elif ch == '{' or ch == '}':
+            pass
+        else:
+            pass
+
+    return results
+
+
 def build_model_entity(
     configuration: dict,
     keys: list[str],
@@ -274,7 +307,15 @@ def build_model_entity(
     replaced = []
     in_replaced = []
 
-    for attr in configuration.get("attributes", []):
+    attrs = configuration.get("attributes", [])
+    order = get_order_entities(vfmt)
+
+    attrs_sorted = sorted(
+        attrs,
+        key=lambda a: order.index(a["key"]) if a.get("key") in order else len(order)
+    )
+
+    for attr in attrs_sorted:
         kattr = attr.get("key")
         vattr = str(attr.get("value", ""))
         rattr = attr.get("requirements", True)
@@ -309,8 +350,8 @@ def build_model_entity(
             if ir["ikey"] == ke:
                 ents[n][0] = st - len(ir["key"]) - 2
                 ents[n][1] = ed - len(ir["key"]) - 2
-    
-    return { "text": vfmt, "entities": ents }
+
+    return { "text": vfmt.strip(), "entities": ents }
 
 def is_integer(value: any) -> bool:
     try:
