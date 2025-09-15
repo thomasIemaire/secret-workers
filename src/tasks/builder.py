@@ -104,7 +104,7 @@ def build_model_configuration(
 
     for attr in catt:
         kattr = attr.get("key")
-        fattr = attr.get("frequency", 1)
+        fattr = float(attr.get("frequency", 1))
         rattr = attr.get("requirements", [])
         vattr = attr.get("value") if fattr > random.random() else False
 
