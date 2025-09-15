@@ -44,7 +44,10 @@ def run_task(*, doc: dict=None, db=None, MAX_WORKERS=2):
             "created_at": datetime.utcnow(),
             "model": ObjectId(model_id),
             "version": version,
-            "path": f"sardine.agents/{model.get('reference')}/{version}",
+            "name": doc.get('name'),
+            "reference": doc.get('reference'),
+            "description": doc.get('description'),
+            "path": f"sardine.agents/{doc.get('reference')}/{version}",
             "status": "enabled",
         })
 
