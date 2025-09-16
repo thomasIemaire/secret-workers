@@ -39,6 +39,8 @@ def run_task(*, doc: dict=None, db=None, MAX_WORKERS=2):
 
         col_tasks.update_one({"_id": doc["_id"]}, {"$set": {"status": "completed", "finished_at": datetime.utcnow()}})
 
+        path = f"sardine.agents/{doc.get('reference')}/{version}"
+
         col_agents.insert_one({
             "created_by": doc.get("created_by"),
             "created_at": datetime.utcnow(),
@@ -47,9 +49,15 @@ def run_task(*, doc: dict=None, db=None, MAX_WORKERS=2):
             "name": doc.get('name'),
             "reference": doc.get('reference'),
             "description": doc.get('description'),
-            "path": f"sardine.agents/{doc.get('reference')}/{version}",
+            "path": path,
             "status": "enabled",
         })
+
+        for repo in os.listdir(path):
+            if repo.startswith('checkpoint-'):
+                checkpoint_path = os.path.join(path, repo)
+                if os.path.isdir(checkpoint_path):
+                    os.remove(checkpoint_path)
 
         print(f"[{jid}] done ✅", flush=True)
     except Exception as e:
