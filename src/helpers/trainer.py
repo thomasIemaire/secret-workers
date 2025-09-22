@@ -24,6 +24,7 @@ from transformers import (
     DataCollatorForLanguageModeling,
     DataCollatorForTokenClassification,
     EarlyStoppingCallback,
+    SchedulerType,
     Trainer,
     TrainingArguments,
 )
@@ -91,6 +92,31 @@ def _ensure_bool(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
     return bool(value)
+
+
+def _resolve_scheduler_type(value: Any) -> SchedulerType:
+    if isinstance(value, SchedulerType):
+        return value
+
+    if value is None:
+        return SchedulerType.LINEAR
+
+    try:
+        scheduler_value = str(value).strip()
+    except Exception:
+        scheduler_value = ""
+
+    if not scheduler_value:
+        return SchedulerType.LINEAR
+
+    try:
+        return SchedulerType(scheduler_value.lower())
+    except ValueError:
+        LOGGER.warning(
+            "Type de scheduler invalide '%s', utilisation de 'linear'",
+            value,
+        )
+        return SchedulerType.LINEAR
 
 
 def _sanitize_for_json(value: Any) -> Any:
@@ -364,7 +390,7 @@ def trainer(
 
     warmup_ratio = _ensure_float(parameters.get("warmup_ratio"), 0.0)
     warmup_steps = _ensure_int(parameters.get("warmup_steps"), 0)
-    lr_scheduler_type = parameters.get("lr_scheduler_type")
+    lr_scheduler_type = _resolve_scheduler_type(parameters.get("lr_scheduler_type"))
 
     args = TrainingArguments(
         output_dir=str(output_dir),
