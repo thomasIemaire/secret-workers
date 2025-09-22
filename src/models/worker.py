@@ -1,9 +1,33 @@
-import threading
+"""Worker thread utilities."""
+
+from __future__ import annotations
+
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Callable, Optional
+
+TaskClaimFn = Callable[[], Optional[dict]]
+TaskRunFn = Callable[..., Any]
+
 
 class Worker:
-    def __init__(self, name, claim_fn, run_fn, max_workers, poll_delay, stop_event: threading.Event, *, db):
+    """Manage a pool of worker threads dedicated to a specific task type."""
+
+    def __init__(
+        self,
+        name: str,
+        claim_fn: TaskClaimFn,
+        run_fn: TaskRunFn,
+        max_workers: int,
+        poll_delay: float,
+        stop_event: threading.Event,
+        *,
+        db: Any,
+    ) -> None:
+        if max_workers <= 0:
+            raise ValueError("max_workers must be a positive integer")
+
         self.name = name
         self.claim_fn = claim_fn
         self.run_fn = run_fn
@@ -11,17 +35,18 @@ class Worker:
         self.poll_delay = poll_delay
         self.db = db
         self.stop_event = stop_event
-        self._thread = None
+        self._thread: Optional[threading.Thread] = None
+        self._logger = logging.getLogger(f"worker.{name}")
 
-    def _loop(self):
-        logging.info(f"{self.name}: démarrage (threads={self.max_workers})")
-        futures = set()
-        with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix=self.name) as executor:
+    def _loop(self) -> None:
+        self._logger.info("démarrage (threads=%s)", self.max_workers)
+        futures: set[Future[Any]] = set()
+        with ThreadPoolExecutor(
+            max_workers=self.max_workers, thread_name_prefix=self.name
+        ) as executor:
             while not self.stop_event.is_set():
-                # Nettoyage des futures terminées
-                futures = {f for f in futures if not f.done()}
+                futures = {future for future in futures if not future.done()}
 
-                # Remplir le pool
                 made_progress = False
                 while not self.stop_event.is_set() and len(futures) < self.max_workers:
                     task = self.claim_fn()
@@ -30,25 +55,30 @@ class Worker:
                     futures.add(executor.submit(self._run_one, task))
                     made_progress = True
 
-                # Eviter le busy-wait : attendre avec timeout
                 if not made_progress:
-                    # si pas de tâche dispo -> attendre poll_delay, sinon on est à capacité -> petite attente
-                    timeout = self.poll_delay if len(futures) < self.max_workers else 0.2
+                    timeout = (
+                        self.poll_delay
+                        if len(futures) < self.max_workers
+                        else 0.2
+                    )
                     self.stop_event.wait(timeout)
 
-        logging.info(f"{self.name}: arrêt propre")
+        self._logger.info("arrêt propre")
 
-    def _run_one(self, task):
+    def _run_one(self, task: dict) -> None:
         try:
-            return self.run_fn(doc=task, db=self.db, MAX_WORKERS=self.max_workers)
-        except Exception as e:
-            logging.exception(f"{self.name}: échec de la tâche {task}: {e}")
+            self.run_fn(doc=task, db=self.db, MAX_WORKERS=self.max_workers)
+        except Exception:  # pragma: no cover - defensive logging
+            self._logger.exception("échec de la tâche %s", task)
 
-    def start(self):
-        self._thread = threading.Thread(target=self._loop, name=f"mgr-{self.name}", daemon=True)
+    def start(self) -> "Worker":
+        self._thread = threading.Thread(
+            target=self._loop, name=f"mgr-{self.name}", daemon=True
+        )
         self._thread.start()
         return self
 
-    def join(self):
+    def join(self) -> None:
         if self._thread is not None:
             self._thread.join()
+            self._thread = None

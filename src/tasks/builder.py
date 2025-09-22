@@ -1,85 +1,114 @@
-from bson import ObjectId
+"""Dataset generation task."""
+
+from __future__ import annotations
+
+import logging
+import random
+import re
+from collections.abc import Iterable, Mapping
 from datetime import datetime
-from typing import Literal, Optional
-import os, time, random, re, copy, rstr
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-context_db = None
+import rstr
+from bson import ObjectId
 
-def run_task(*, doc: dict= None, db=None, MAX_WORKERS=2) -> dict:
-    if doc is None: return 
-    
-    global context_db
-    context_db = db
-    
-    col_tasks = db.get_collection("datasets")
-    col_data = db.get_collection("datasets_data")
-    col_models = db.get_collection("models")
-    col_configs = db.get_collection("models_configurations")
+LOGGER = logging.getLogger(__name__)
+PLACEHOLDER_PATTERN = re.compile(r"\{(?P<key>[^:{}]+)(?::[^{}]*)?\}")
+BULK_INSERT_SIZE = 500
 
-    docdtid = str(doc["_id"])
-    model = col_models.find_one({"_id": ObjectId(doc.get("model"))})
 
-    mversion = model.get("version", "1.0")
-    ments = model.get("entities", {})
-    mkeys = list(ments.keys())
+def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: int = 2) -> None:
+    if not doc or db is None:
+        LOGGER.warning("builder: tâche ignorée (doc ou db manquant)")
+        return
 
-    mcid = model.get("configuration", None)
-    if not mcid:
+    datasets = db.get_collection("datasets")
+    data_collection = db.get_collection("datasets_data")
+    models = db.get_collection("models")
+    configs = db.get_collection("models_configurations")
+
+    dataset_id = doc["_id"]
+    if not isinstance(dataset_id, ObjectId):
+        dataset_id = ObjectId(dataset_id)
+
+    model_id = doc.get("model")
+    if not model_id:
         raise ValueError("Model configuration is missing")
 
-    configuration = col_configs.find_one({"_id": ObjectId(mcid)})
+    if not isinstance(model_id, ObjectId):
+        model_id = ObjectId(model_id)
 
-    dataset = []
+    model = models.find_one({"_id": model_id})
+    if not model:
+        raise ValueError(f"Model introuvable: {model_id}")
 
-    size = doc.get("size", "recommended")
-    n_max = configuration.get("possibilities", 1e5)
-    n_size = size.get("size", n_max)
-    if is_integer(n_size):
-        n_size = int(n_size)
+    configuration_id = model.get("configuration")
+    if not configuration_id:
+        raise ValueError("Model configuration is missing")
+
+    if not isinstance(configuration_id, ObjectId):
+        configuration_id = ObjectId(configuration_id)
+
+    configuration = configs.find_one({"_id": configuration_id})
+    if not configuration:
+        raise ValueError(f"Configuration introuvable: {configuration_id}")
+
+    entity_keys = list((model.get("entities") or {}).keys())
+    randomizers = model.get("randomizers") or []
+    builder = DatasetBuilder(configuration=configuration, db=db, entity_keys=entity_keys, randomizers=randomizers)
+
+    size_info = doc.get("size", {})
+    max_possibilities = int(configuration.get("possibilities", 1e5))
+    formats_count = len(configuration.get("formats") or [])
+    dataset_size = determine_dataset_size(size_info, max_possibilities, formats_count)
+
+    LOGGER.info("builder[%s]: génération de %s entrées", dataset_id, dataset_size)
+    datasets.update_one(
+        {"_id": dataset_id},
+        {"$set": {"status": "generating", "progress": 0.0}},
+    )
+
+    samples: List[Dict[str, Any]] = []
+    update_interval = max(1, dataset_size // 100)
+    for index in range(dataset_size):
+        samples.append(builder.generate_sample())
+        if (index + 1) % update_interval == 0 or index + 1 == dataset_size:
+            progress = (index + 1) / dataset_size
+            datasets.update_one({"_id": dataset_id}, {"$set": {"progress": progress}})
+
+    payloads = [
+        {"dataset": dataset_id, "data": sample, "created_at": datetime.utcnow()}
+        for sample in samples
+    ]
+
+    for start in range(0, len(payloads), BULK_INSERT_SIZE):
+        chunk = payloads[start : start + BULK_INSERT_SIZE]
+        if chunk:
+            data_collection.insert_many(chunk)
+
+    datasets.update_one(
+        {"_id": dataset_id},
+        {"$set": {"status": "generated", "progress": 0.0}},
+    )
+
+
+def determine_dataset_size(size_info: Any, max_size: int, formats_count: int) -> int:
+    formats_count = max(1, formats_count)
+    if isinstance(size_info, Mapping):
+        requested = size_info.get("size", max_size)
     else:
-        n_size = model_build_calculate_size(n_size, n_max, len(configuration.get("formats", [])))
+        requested = size_info or max_size
 
-    progress = 0
-    col_tasks.update_one({"_id": ObjectId(docdtid)}, {"$set": {"status": "generating", "progress": progress}})
+    if is_integer(requested):
+        value = max(1, int(requested))
+        return min(value, max_size)
 
-    for _ in range(int(n_size)):
-        mvb = build_model_configuration(copy.deepcopy(configuration))
+    keyword = str(requested).lower()
+    return calculate_size_from_keyword(keyword, max_size, formats_count)
 
-        try:
-            mrd = random.choice(model.get("randomizers", []))
-            rdm = build_model_configuration_randomizers(mrd)
-            mvb["format"] = rdm(mvb["format"])
-        except: pass
-        
-        dataset.append(
-            build_model_entity(
-                mvb,
-                mkeys
-            )
-        )
 
-        time.sleep(1e-9)
-
-        n_progress = float((len(dataset) / n_size))
-        if n_progress > progress:
-            progress = n_progress
-            col_tasks.update_one({"_id": ObjectId(docdtid)}, {"$set": {"progress": progress}})
-
-    for data in dataset:
-        col_data.insert_one({
-            "dataset": ObjectId(docdtid),
-            "data": data,
-            "created_at": datetime.utcnow(),
-        })
-
-    col_tasks.update_one({"_id": ObjectId(docdtid)}, {"$set": {"status": "generated", "progress": 0.0}})
-
-def model_build_calculate_size(
-        size: str,
-        max_size: int,
-        formats_size: int
-    ) -> int:
-    match size:
+def calculate_size_from_keyword(keyword: str, max_size: int, formats_size: int) -> int:
+    match keyword:
         case "complete":
             return max_size
         case "advanced":
@@ -89,277 +118,242 @@ def model_build_calculate_size(
         case "small":
             return max_size // formats_size // 2
         case "tiny":
-            return max_size // formats_size // 5
+            return max(max_size // formats_size // 5, 1)
         case _:
-            return int(1e3)
+            return min(max_size, 1000)
 
-def build_model_configuration(
-        configuration: dict
-    ) -> dict:
-    catt = configuration.get("attributes")
-    cfmt = configuration.get("formats")
 
-    sfmt = random.choice(cfmt)
-    satt = []
+class DatasetBuilder:
+    def __init__(
+        self,
+        *,
+        configuration: Mapping[str, Any],
+        db,
+        entity_keys: Sequence[str],
+        randomizers: Sequence[Mapping[str, Any]],
+    ) -> None:
+        self.configuration = configuration
+        self.db = db
+        self.entity_keys = list(entity_keys)
+        self.randomizers = list(randomizers)
 
-    for attr in catt:
-        kattr = attr.get("key")
-        fattr = float(attr.get("frequency", 1))
-        rattr = attr.get("requirements", [])
-        vattr = attr.get("value") if fattr > random.random() else False
+    def generate_sample(self) -> Dict[str, Any]:
+        built_config = self._build_configuration(self.configuration)
+        template = built_config["template"]
+        attributes = built_config["attributes"]
+        resolved_text, entities = self._render_entity(template, attributes)
+        resolved_text = self._apply_randomizer(resolved_text)
+        return {"text": resolved_text.strip(), "entities": entities}
 
-        if isinstance(vattr, dict):
-            tvattr = vattr.get("type")
-            rvattr = vattr.get("rule")
-            pvattr = vattr.get("parameters", {})
-            bvattr, bcattrs = build_model_configuration_value(tvattr, rvattr, pvattr)
+    def _build_configuration(self, configuration: Mapping[str, Any]) -> Dict[str, Any]:
+        template = random.choice(configuration.get("formats") or [""])
+        attributes = configuration.get("attributes") or []
+        built_attributes: List[Dict[str, Any]] = []
 
-            if bcattrs:
-                for bcattr in bcattrs:
-                    satt.append(bcattr)
-        
-        satt.append({
-            "key": kattr,
-            "value": bvattr if vattr else '',
-            "requirements": build_model_configuration_requirements(bvattr, rattr) if vattr else True
-        })
+        for attribute in attributes:
+            built_attr, extra_attrs = self._build_attribute(attribute)
+            built_attributes.append(built_attr)
+            built_attributes.extend(extra_attrs)
 
-    bfmt = build_model_configuration_format(sfmt, satt)
-    configuration['attributes'] = satt
-    configuration['format'] = re.sub(r'\s+', ' ', bfmt.strip())
+        return {"template": re.sub(r"\s+", " ", template.strip()), "attributes": built_attributes}
 
-    return configuration
+    def _build_attribute(self, attribute: Mapping[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        key = attribute.get("key")
+        frequency = float(attribute.get("frequency", 1))
+        include = random.random() <= frequency
+        requirements = attribute.get("requirements") or []
 
-def build_model_configuration_value(
-    vtype: Literal["number", "string"],
-    rule: str,
-    parameters: dict
-) -> Optional[int | str]:
-    value = None
+        value_spec = attribute.get("value") if include else None
+        extra_attrs: List[Dict[str, Any]] = []
+        value: Any = ""
 
-    match rule:
-        case "randint":
-            vmin = int(parameters.get("min", 0))
-            vmax = int(parameters.get("max", 100))
-            if vmin > vmax: vmin, vmax = vmax, vmin
-            value = random.randint(vmin, vmax)
+        if isinstance(value_spec, Mapping):
+            value, extra_attrs = self._build_dynamic_value(value_spec)
+        elif value_spec is not None:
+            value = value_spec
 
-        case "alphanum":
-            regex = parameters.get("regex", "")
-            value = rstr.xeger(regex)
+        requirement_ok = True
+        if include and value not in (None, ""):
+            requirement_ok = self._check_requirements(value, requirements)
+            if not requirement_ok:
+                value = ""
 
-        case "data":
-            data_id = parameters.get("object_id")
-            if data_id:
-                data = context_db.get_collection("models_data").find_one({"_id": ObjectId(data_id)})
-                value = random.choice(data.get("data", []))
+        return (
+            {"key": key, "value": "" if value is None else value, "requirements": requirement_ok},
+            extra_attrs,
+        )
 
-        case "configuration":
-            config_id = parameters.get("object_id")
-            if config_id:
-                config = context_db.get_collection("models_configurations").find_one({"_id": ObjectId(config_id)})
-                value = build_model_configuration(config)
-                return value.get("format", ""), config.get("attributes", [])
-    
-    if value is None: return None, None
-        
-    return build_model_configuration_vtype(vtype, value), None
+    def _build_dynamic_value(self, spec: Mapping[str, Any]) -> Tuple[Any, List[Dict[str, Any]]]:
+        value_type = spec.get("type", "string")
+        rule = spec.get("rule")
+        parameters = spec.get("parameters") or {}
 
-def build_model_configuration_vtype(
-    vtype: Literal["number", "string"],
-    value: any
-) -> Optional[int | str]:
-    match vtype:
-        case "number":
-            try:
-                return int(value)
-            except:
-                return str(value)
-        case _:
-            return str(value)
-
-def build_model_configuration_requirements(
-    value: any,
-    requirements: list[dict]
-) -> bool:
-    for req in requirements:
-        rreq = req.get("rule")
-        creq = req.get("constraint")
-
-        match rreq:
-            case "regex":
-                if not re.match(creq, str(value)):
-                    return False
-            case "eq":
-                if str(value) != str(creq):
-                    return False
-            case "neq":
-                if str(value) == str(creq):
-                    return False
-            case "gt":
-                try:
-                    if float(value) <= float(creq):
-                        return False
-                except: pass
-            case "lt":
-                try:
-                    if float(value) >= float(creq):
-                        return False
-                except: pass
-            case "gte":
-                try:
-                    if float(value) < float(creq):
-                        return False
-                except: pass
-            case "lte":
-                try:
-                    if float(value) > float(creq):
-                        return False
-                except: pass
-            case "in":
-                creq  = [x.strip() for x in creq.split(",")] if isinstance(creq, str) else creq
-                if str(value) not in map(str, creq):
-                    return False
-            case "nin":
-                creq  = [x.strip() for x in creq.split(",")] if isinstance(creq, str) else creq
-                if str(value) in map(str, creq):
-                    return False
-            case "contains":
-                if str(creq) not in str(value):
-                    return False
-            case "ncontains":
-                if str(creq) in str(value):
-                    return False
+        match rule:
+            case "randint":
+                minimum = int(parameters.get("min", 0))
+                maximum = int(parameters.get("max", 100))
+                if minimum > maximum:
+                    minimum, maximum = maximum, minimum
+                value = random.randint(minimum, maximum)
+                return coerce_type(value_type, value), []
+            case "alphanum":
+                regex = parameters.get("regex", "")
+                value = rstr.xeger(regex) if regex else ""
+                return coerce_type(value_type, value), []
+            case "data":
+                data_id = parameters.get("object_id")
+                if data_id:
+                    record = self.db.get_collection("models_data").find_one({"_id": ObjectId(data_id)})
+                    if record and record.get("data"):
+                        value = random.choice(record["data"])
+                        return coerce_type(value_type, value), []
+                return "", []
+            case "configuration":
+                config_id = parameters.get("object_id")
+                if config_id:
+                    nested = self.db.get_collection("models_configurations").find_one({"_id": ObjectId(config_id)})
+                    if nested:
+                        built = self._build_configuration(nested)
+                        return built.get("template", ""), built.get("attributes", [])
+                return "", []
             case _:
-                pass
-                
-    return True
+                return "", []
 
-def build_model_configuration_format(
-    format: str,
-    attributes: list[dict]
-) -> str:
-    for attr in attributes:
-        kattr = attr.get("key")
-        vattr = str(attr.get("value", ""))
-        # format = format.replace(f"{{{kattr}}}", str(vattr))
-        format = format.replace(f"{{{kattr}}}", f"{{{kattr}:{vattr}}}")
-    return format
+    def _check_requirements(self, value: Any, requirements: Iterable[Mapping[str, Any]]) -> bool:
+        for requirement in requirements or []:
+            rule = requirement.get("rule")
+            constraint = requirement.get("constraint")
+            try:
+                if rule == "regex":
+                    if not re.match(str(constraint), str(value)):
+                        return False
+                elif rule == "eq" and str(value) != str(constraint):
+                    return False
+                elif rule == "neq" and str(value) == str(constraint):
+                    return False
+                elif rule == "gt" and float(value) <= float(constraint):
+                    return False
+                elif rule == "lt" and float(value) >= float(constraint):
+                    return False
+                elif rule == "gte" and float(value) < float(constraint):
+                    return False
+                elif rule == "lte" and float(value) > float(constraint):
+                    return False
+                elif rule == "in":
+                    if str(value) not in split_constraint(constraint):
+                        return False
+                elif rule == "nin":
+                    if str(value) in split_constraint(constraint):
+                        return False
+                elif rule == "contains" and str(constraint) not in str(value):
+                    return False
+                elif rule == "ncontains" and str(constraint) in str(value):
+                    return False
+            except Exception:
+                return False
+        return True
 
-def build_model_configuration_randomizers(
-    randomizer:  str
-) -> lambda x: x:
-    rrand = randomizer.get("rule")
-    frand = randomizer.get("frequency", 1)
+    def _render_entity(
+        self,
+        template: str,
+        attributes: Sequence[Mapping[str, Any]],
+    ) -> Tuple[str, List[List[Any]]]:
+        attr_map = {attr.get("key"): attr for attr in attributes}
+        resolved_values: Dict[str, str] = {}
 
-    f = None
+        def resolve_value(key: str, stack: Optional[List[str]] = None) -> str:
+            stack = stack or []
+            if key in resolved_values:
+                return resolved_values[key]
+            if key in stack:
+                return ""
+            attr = attr_map.get(key)
+            if not attr or not attr.get("requirements", True):
+                resolved = ""
+            else:
+                raw_value = str(attr.get("value", ""))
+                parts = []
+                last = 0
+                for match in PLACEHOLDER_PATTERN.finditer(raw_value):
+                    parts.append(raw_value[last : match.start()])
+                    nested_key = match.group("key")
+                    parts.append(resolve_value(nested_key, stack + [key]))
+                    last = match.end()
+                parts.append(raw_value[last:])
+                resolved = "".join(parts)
+            resolved_values[key] = resolved
+            return resolved
 
-    match rrand:
-        case "upper":
-            f = lambda x: x.upper()
-        case "lower":
-            f = lambda x: x.lower()
-        case _:
-            f = lambda x: x
+        parts: List[str] = []
+        entities: List[List[Any]] = []
+        cursor = 0
+        last_index = 0
 
-    return f if frand >= random.random() else lambda x: x
+        for match in PLACEHOLDER_PATTERN.finditer(template):
+            parts.append(template[last_index : match.start()])
+            cursor += len(template[last_index : match.start()])
 
-def get_order_entities(
-    text: str
-) -> list[str]:
-    results = []
-    stack = []
-    key = ''
-    reading_key = False
-    reading_value = False
+            key = match.group("key")
+            value = resolve_value(key)
 
-    for i, ch in enumerate(text):
-        if ch == '{':
-            reading_key = True
-            key = ''
-        elif ch == ':' and reading_key:
-            # fin de clé
-            stack.append(key)
-            reading_key = False
-            reading_value = True
-            key = ''
-        elif ch == '}':
-            if stack:
-                results.append(stack.pop())
-            reading_value = False
-        elif reading_key:
-            key += ch
-        elif ch == '{' or ch == '}':
-            pass
-        else:
-            pass
+            if key in self.entity_keys and value:
+                start = cursor
+                cursor += len(value)
+                entities.append([start, cursor, key])
+            else:
+                cursor += len(value)
 
-    return results
+            parts.append(value)
+            last_index = match.end()
+
+        parts.append(template[last_index:])
+        cursor += len(template[last_index:])
+
+        final_text = "".join(parts)
+        return final_text, entities
+
+    def _apply_randomizer(self, text: str) -> str:
+        if not self.randomizers:
+            return text
+        randomizer = random.choice(self.randomizers)
+        frequency = float(randomizer.get("frequency", 1))
+        if random.random() > frequency:
+            return text
+        rule = randomizer.get("rule")
+        if rule == "upper":
+            return text.upper()
+        if rule == "lower":
+            return text.lower()
+        return text
 
 
-def build_model_entity(
-    configuration: dict,
-    keys: list[str],
-) -> dict:
-    vfmt = configuration.get("format", "")
-    ents = []
+def coerce_type(value_type: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if value_type == "number":
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return value
+    return str(value)
 
-    replaced = []
-    in_replaced = []
 
-    attrs = configuration.get("attributes", [])
-    order = get_order_entities(vfmt)
+def split_constraint(constraint: Any) -> List[str]:
+    if isinstance(constraint, str):
+        return [part.strip() for part in constraint.split(",") if part.strip()]
+    if isinstance(constraint, Iterable):
+        return [str(item) for item in constraint]
+    return [str(constraint)]
 
-    attrs_sorted = sorted(
-        attrs,
-        key=lambda a: order.index(a["key"]) if a.get("key") in order else len(order)
-    )
 
-    for attr in attrs_sorted:
-        kattr = attr.get("key")
-        vattr = str(attr.get("value", ""))
-        rattr = attr.get("requirements", True)
-
-        continue_f = True
-
-        if not kattr in keys or \
-            vattr == '' or not rattr:
-            continue_f = False
-
-        for r in replaced:
-            if r['format'] in vattr:
-                vattr = vattr.replace(r['format'], r['value'])
-                in_replaced.append({"ikey": r["key"], "key": kattr}) 
-
-        strvattr = f"{{{kattr}:{vattr}}}" #
-        # strvattr = str(vattr)
-
-        replaced.append({"format": strvattr, "value": vattr, "key": kattr})
-
-        sta = vfmt.lower().find(strvattr.lower()) if vattr else -1
-        vfmt = vfmt.replace(strvattr, str(vattr)) #
-        if sta == -1 or not continue_f: continue
-        # end = sta + len(strvattr)
-        end = sta + len(vattr) #
-
-        ents.append([sta, end, kattr])
-
-    for ir in in_replaced:
-        for n in range(len(ents)):
-            st, ed, ke = ents[n]
-            if ir["ikey"] == ke:
-                ents[n][0] = st - len(ir["key"]) - 2
-                ents[n][1] = ed - len(ir["key"]) - 2
-
-    return { "text": vfmt.strip(), "entities": ents }
-
-def is_integer(value: any) -> bool:
+def is_integer(value: Any) -> bool:
     try:
         int(value)
         return True
     except (ValueError, TypeError):
         return False
-    
+
+
 def bump_version(version: str, bump: str) -> str:
     major, minor = map(int, version.split("."))
     if bump == "major":
