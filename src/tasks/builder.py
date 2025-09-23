@@ -334,33 +334,71 @@ class DatasetBuilder:
         attributes: Sequence[Mapping[str, Any]],
     ) -> Tuple[str, List[List[Any]]]:
         attr_map = {attr.get("key"): attr for attr in attributes}
-        resolved_values: Dict[str, str] = {}
+        resolved_values: Dict[str, Dict[str, Any]] = {}
 
-        def resolve_value(key: str, stack: Optional[List[str]] = None) -> str:
+        def resolve_value(
+            key: str, stack: Optional[List[str]] = None
+        ) -> Dict[str, Any]:
             stack = stack or []
             if key in resolved_values:
                 return resolved_values[key]
-            if key in stack:
-                return ""
+
             attr = attr_map.get(key)
             if not attr:
-                resolved = ""
-            else:
-                raw_value = str(attr.get("value", ""))
-                parts = []
-                last = 0
-                for match in PLACEHOLDER_PATTERN.finditer(raw_value):
-                    parts.append(raw_value[last : match.start()])
-                    nested_key = match.group("key")
-                    parts.append(resolve_value(nested_key, stack + [key]))
-                    last = match.end()
-                parts.append(raw_value[last:])
-                resolved = "".join(parts)
+                result = {"text": "", "entities": []}
+                resolved_values[key] = result
+                return result
+
+            if key in stack:
                 attr["requirements_met"] = self._check_requirements(
-                    resolved, attr.get("requirements")
+                    "", attr.get("requirements")
                 )
-            resolved_values[key] = resolved
-            return resolved
+                result = {"text": "", "entities": []}
+                resolved_values[key] = result
+                return result
+
+            raw_value = str(attr.get("value", ""))
+            parts: List[str] = []
+            nested_entities: List[Tuple[int, int, str]] = []
+            last_index = 0
+            offset = 0
+
+            for match in PLACEHOLDER_PATTERN.finditer(raw_value):
+                literal = raw_value[last_index:match.start()]
+                if literal:
+                    parts.append(literal)
+                    offset += len(literal)
+
+                nested_key = match.group("key")
+                nested_result = resolve_value(nested_key, stack + [key])
+                nested_text = nested_result.get("text", "")
+                parts.append(nested_text)
+
+                nested_length = len(nested_text)
+                if nested_length:
+                    nested_entities.append((offset, offset + nested_length, nested_key))
+
+                for nested_start, nested_end, deeper_key in nested_result.get("entities", []):
+                    nested_entities.append(
+                        (offset + nested_start, offset + nested_end, deeper_key)
+                    )
+
+                offset += nested_length
+                last_index = match.end()
+
+            tail = raw_value[last_index:]
+            if tail:
+                parts.append(tail)
+                offset += len(tail)
+
+            resolved = "".join(parts)
+            attr["requirements_met"] = self._check_requirements(
+                resolved, attr.get("requirements")
+            )
+
+            result = {"text": resolved, "entities": nested_entities}
+            resolved_values[key] = result
+            return result
 
         parts: List[str] = []
         entities: List[List[Any]] = []
@@ -372,19 +410,29 @@ class DatasetBuilder:
             cursor += len(template[last_index : match.start()])
 
             key = match.group("key")
-            value = resolve_value(key)
+            value_info = resolve_value(key)
+            value = value_info.get("text", "")
             attr = attr_map.get(key)
             requirements_met = True if attr is None else attr.get("requirements_met", True)
 
+            start = cursor
             if key in self.entity_keys and value and requirements_met:
-                start = cursor
-                cursor += len(value)
-                entities.append([start, cursor, key])
-            else:
-                cursor += len(value)
+                end = start + len(value)
+                entities.append([start, end, key])
+            cursor += len(value)
 
             parts.append(value)
             last_index = match.end()
+
+            for nested_start, nested_end, nested_key in value_info.get("entities", []):
+                if nested_end <= nested_start:
+                    continue
+                nested_attr = attr_map.get(nested_key)
+                nested_requirements_met = (
+                    True if nested_attr is None else nested_attr.get("requirements_met", True)
+                )
+                if nested_key in self.entity_keys and nested_requirements_met:
+                    entities.append([start + nested_start, start + nested_end, nested_key])
 
         parts.append(template[last_index:])
         cursor += len(template[last_index:])
