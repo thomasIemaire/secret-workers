@@ -268,7 +268,7 @@ class DatasetBuilder:
             if key in stack:
                 return ""
             attr = attr_map.get(key)
-            if not attr or not attr.get("requirements", True):
+            if not attr:
                 resolved = ""
             else:
                 raw_value = str(attr.get("value", ""))
@@ -295,8 +295,10 @@ class DatasetBuilder:
 
             key = match.group("key")
             value = resolve_value(key)
+            attr = attr_map.get(key)
+            requirements_met = True if attr is None else bool(attr.get("requirements", True))
 
-            if key in self.entity_keys and value:
+            if key in self.entity_keys and value and requirements_met:
                 start = cursor
                 cursor += len(value)
                 entities.append([start, cursor, key])
