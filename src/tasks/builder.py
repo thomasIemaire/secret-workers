@@ -7,7 +7,7 @@ import random
 import re
 from collections.abc import Iterable, Mapping
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import rstr
 from bson import ObjectId
@@ -15,6 +15,20 @@ from bson import ObjectId
 LOGGER = logging.getLogger(__name__)
 PLACEHOLDER_PATTERN = re.compile(r"\{(?P<key>[^:{}]+)(?::[^{}]*)?\}")
 BULK_INSERT_SIZE = 500
+
+
+def normalize_requirements(requirement_spec: Any) -> List[Mapping[str, Any]]:
+    if isinstance(requirement_spec, Mapping):
+        return [dict(requirement_spec)]
+    if isinstance(requirement_spec, Iterable) and not isinstance(
+        requirement_spec, (str, bytes)
+    ):
+        normalized: List[Mapping[str, Any]] = []
+        for requirement in requirement_spec:
+            if isinstance(requirement, Mapping):
+                normalized.append(dict(requirement))
+        return normalized
+    return []
 
 
 def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: int = 2) -> None:
@@ -56,6 +70,7 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
     entity_keys = list((model.get("entities") or {}).keys())
     randomizers = model.get("randomizers") or []
     builder = DatasetBuilder(configuration=configuration, db=db, entity_keys=entity_keys, randomizers=randomizers)
+    dataset_requirements = builder.requirements
 
     size_info = doc.get("size", {})
     max_possibilities = int(configuration.get("possibilities", 1e5))
@@ -65,7 +80,7 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
     LOGGER.info("builder[%s]: génération de %s entrées", dataset_id, dataset_size)
     datasets.update_one(
         {"_id": dataset_id},
-        {"$set": {"status": "generating", "progress": 0.0}},
+        {"$set": {"status": "generating", "progress": 0.0, "requirements": dataset_requirements}},
     )
 
     samples: List[Dict[str, Any]] = []
@@ -136,6 +151,16 @@ class DatasetBuilder:
         self.db = db
         self.entity_keys = list(entity_keys)
         self.randomizers = list(randomizers)
+        self.requirements_map: Dict[str, List[Mapping[str, Any]]] = {}
+        self._visited_config_ids: Set[str] = set()
+        self._collect_requirements(self.configuration)
+
+    @property
+    def requirements(self) -> Dict[str, List[Mapping[str, Any]]]:
+        return {
+            key: [dict(requirement) for requirement in requirements]
+            for key, requirements in self.requirements_map.items()
+        }
 
     def generate_sample(self) -> Dict[str, Any]:
         built_config = self._build_configuration(self.configuration)
@@ -144,6 +169,61 @@ class DatasetBuilder:
         resolved_text, entities = self._render_entity(template, attributes)
         resolved_text = self._apply_randomizer(resolved_text)
         return {"text": resolved_text.strip(), "entities": entities}
+
+    def _collect_requirements(self, configuration: Mapping[str, Any]) -> None:
+        config_identifier = configuration.get("_id")
+        identifier_str: Optional[str] = None
+        if isinstance(config_identifier, ObjectId):
+            identifier_str = str(config_identifier)
+        elif config_identifier is not None:
+            try:
+                identifier_str = str(ObjectId(config_identifier))
+            except Exception:
+                identifier_str = None
+
+        if identifier_str:
+            if identifier_str in self._visited_config_ids:
+                return
+            self._visited_config_ids.add(identifier_str)
+
+        attributes = configuration.get("attributes") or []
+        for attribute in attributes:
+            key = attribute.get("key")
+            if key:
+                requirements = normalize_requirements(attribute.get("requirements"))
+                if key not in self.requirements_map or requirements:
+                    self.requirements_map[key] = requirements
+
+            value_spec = attribute.get("value")
+            if isinstance(value_spec, Mapping):
+                self._collect_requirements_from_value(value_spec)
+
+    def _collect_requirements_from_value(self, value_spec: Mapping[str, Any]) -> None:
+        rule = value_spec.get("rule")
+        if rule != "configuration":
+            return
+
+        parameters = value_spec.get("parameters") or {}
+        config_id = parameters.get("object_id")
+        if config_id is None:
+            return
+
+        object_id: Optional[ObjectId]
+        if isinstance(config_id, ObjectId):
+            object_id = config_id
+        else:
+            try:
+                object_id = ObjectId(config_id)
+            except Exception:
+                return
+
+        identifier_str = str(object_id)
+        if identifier_str in self._visited_config_ids:
+            return
+
+        nested = self.db.get_collection("models_configurations").find_one({"_id": object_id})
+        if nested:
+            self._collect_requirements(nested)
 
     def _build_configuration(self, configuration: Mapping[str, Any]) -> Dict[str, Any]:
         template = random.choice(configuration.get("formats") or [""])
@@ -161,7 +241,7 @@ class DatasetBuilder:
         key = attribute.get("key")
         frequency = float(attribute.get("frequency", 1))
         include = random.random() <= frequency
-        requirements = attribute.get("requirements") or []
+        requirements = normalize_requirements(attribute.get("requirements"))
 
         value_spec = attribute.get("value") if include else None
         extra_attrs: List[Dict[str, Any]] = []
@@ -172,16 +252,11 @@ class DatasetBuilder:
         elif value_spec is not None:
             value = value_spec
 
-        requirement_ok = True
-        if include and value not in (None, ""):
-            requirement_ok = self._check_requirements(value, requirements)
-            # if not requirement_ok:
-            #     value = ""
+        attribute_payload: Dict[str, Any] = {"key": key, "value": "" if value is None else value}
+        if requirements:
+            attribute_payload["requirements"] = requirements
 
-        return (
-            {"key": key, "value": "" if value is None else value, "requirements": requirement_ok},
-            extra_attrs,
-        )
+        return attribute_payload, extra_attrs
 
     def _build_dynamic_value(self, spec: Mapping[str, Any]) -> Tuple[Any, List[Dict[str, Any]]]:
         value_type = spec.get("type", "string")
@@ -259,30 +334,71 @@ class DatasetBuilder:
         attributes: Sequence[Mapping[str, Any]],
     ) -> Tuple[str, List[List[Any]]]:
         attr_map = {attr.get("key"): attr for attr in attributes}
-        resolved_values: Dict[str, str] = {}
+        resolved_values: Dict[str, Dict[str, Any]] = {}
 
-        def resolve_value(key: str, stack: Optional[List[str]] = None) -> str:
+        def resolve_value(
+            key: str, stack: Optional[List[str]] = None
+        ) -> Dict[str, Any]:
             stack = stack or []
             if key in resolved_values:
                 return resolved_values[key]
-            if key in stack:
-                return ""
+
             attr = attr_map.get(key)
-            if not attr or not attr.get("requirements", True):
-                resolved = ""
-            else:
-                raw_value = str(attr.get("value", ""))
-                parts = []
-                last = 0
-                for match in PLACEHOLDER_PATTERN.finditer(raw_value):
-                    parts.append(raw_value[last : match.start()])
-                    nested_key = match.group("key")
-                    parts.append(resolve_value(nested_key, stack + [key]))
-                    last = match.end()
-                parts.append(raw_value[last:])
-                resolved = "".join(parts)
-            resolved_values[key] = resolved
-            return resolved
+            if not attr:
+                result = {"text": "", "entities": []}
+                resolved_values[key] = result
+                return result
+
+            if key in stack:
+                attr["requirements_met"] = self._check_requirements(
+                    "", attr.get("requirements")
+                )
+                result = {"text": "", "entities": []}
+                resolved_values[key] = result
+                return result
+
+            raw_value = str(attr.get("value", ""))
+            parts: List[str] = []
+            nested_entities: List[Tuple[int, int, str]] = []
+            last_index = 0
+            offset = 0
+
+            for match in PLACEHOLDER_PATTERN.finditer(raw_value):
+                literal = raw_value[last_index:match.start()]
+                if literal:
+                    parts.append(literal)
+                    offset += len(literal)
+
+                nested_key = match.group("key")
+                nested_result = resolve_value(nested_key, stack + [key])
+                nested_text = nested_result.get("text", "")
+                parts.append(nested_text)
+
+                nested_length = len(nested_text)
+                if nested_length:
+                    nested_entities.append((offset, offset + nested_length, nested_key))
+
+                for nested_start, nested_end, deeper_key in nested_result.get("entities", []):
+                    nested_entities.append(
+                        (offset + nested_start, offset + nested_end, deeper_key)
+                    )
+
+                offset += nested_length
+                last_index = match.end()
+
+            tail = raw_value[last_index:]
+            if tail:
+                parts.append(tail)
+                offset += len(tail)
+
+            resolved = "".join(parts)
+            attr["requirements_met"] = self._check_requirements(
+                resolved, attr.get("requirements")
+            )
+
+            result = {"text": resolved, "entities": nested_entities}
+            resolved_values[key] = result
+            return result
 
         parts: List[str] = []
         entities: List[List[Any]] = []
@@ -294,17 +410,29 @@ class DatasetBuilder:
             cursor += len(template[last_index : match.start()])
 
             key = match.group("key")
-            value = resolve_value(key)
+            value_info = resolve_value(key)
+            value = value_info.get("text", "")
+            attr = attr_map.get(key)
+            requirements_met = True if attr is None else attr.get("requirements_met", True)
 
-            if key in self.entity_keys and value:
-                start = cursor
-                cursor += len(value)
-                entities.append([start, cursor, key])
-            else:
-                cursor += len(value)
+            start = cursor
+            if key in self.entity_keys and value and requirements_met:
+                end = start + len(value)
+                entities.append([start, end, key])
+            cursor += len(value)
 
             parts.append(value)
             last_index = match.end()
+
+            for nested_start, nested_end, nested_key in value_info.get("entities", []):
+                if nested_end <= nested_start:
+                    continue
+                nested_attr = attr_map.get(nested_key)
+                nested_requirements_met = (
+                    True if nested_attr is None else nested_attr.get("requirements_met", True)
+                )
+                if nested_key in self.entity_keys and nested_requirements_met:
+                    entities.append([start + nested_start, start + nested_end, nested_key])
 
         parts.append(template[last_index:])
         cursor += len(template[last_index:])
