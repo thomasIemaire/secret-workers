@@ -232,6 +232,8 @@ def prepare_dataset(
         offsets = enc.pop("offset_mapping")
 
         labels = [label2id[O_LABEL]] * len(enc["input_ids"])
+        assigned_labels: List[Optional[str]] = [None] * len(offsets)
+        assigned_spans: List[Optional[Tuple[int, int]]] = [None] * len(offsets)
         for i, (start, end) in enumerate(offsets):
             if start == end == 0:
                 labels[i] = -100
@@ -249,6 +251,26 @@ def prepare_dataset(
                     else f"I-{label}"
                 )
                 if tag in label2id:
+                    previous_label = assigned_labels[idx]
+                    previous_span = assigned_spans[idx]
+                    current_span = (start, end)
+                    if previous_label is not None and (
+                        previous_label != label or previous_span != current_span
+                    ):
+                        previous_desc = (
+                            f"{previous_label} {previous_span}"
+                            if previous_span is not None
+                            else previous_label
+                        )
+                        conflict_desc = f"{label} {current_span}"
+                        raise ValueError(
+                            "Les entités qui se chevauchent ne sont pas supportées : "
+                            f"{previous_desc} vs {conflict_desc} dans l'exemple '{text}'. "
+                            "Le modèle de token classification ne peut encoder qu'une seule étiquette par token."
+                        )
+
+                    assigned_labels[idx] = label
+                    assigned_spans[idx] = current_span
                     labels[idx] = label2id[tag]
                     saw_begin = True
 
