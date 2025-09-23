@@ -161,7 +161,15 @@ class DatasetBuilder:
         key = attribute.get("key")
         frequency = float(attribute.get("frequency", 1))
         include = random.random() <= frequency
-        requirements = attribute.get("requirements") or []
+        requirement_spec = attribute.get("requirements")
+        if isinstance(requirement_spec, Mapping):
+            requirements = [requirement_spec]
+        elif isinstance(requirement_spec, Iterable) and not isinstance(
+            requirement_spec, (str, bytes)
+        ):
+            requirements = list(requirement_spec)
+        else:
+            requirements = []
 
         value_spec = attribute.get("value") if include else None
         extra_attrs: List[Dict[str, Any]] = []
@@ -172,16 +180,11 @@ class DatasetBuilder:
         elif value_spec is not None:
             value = value_spec
 
-        requirement_ok = True
-        if include and value not in (None, ""):
-            requirement_ok = self._check_requirements(value, requirements)
-            # if not requirement_ok:
-            #     value = ""
+        attribute_payload: Dict[str, Any] = {"key": key, "value": "" if value is None else value}
+        if requirements:
+            attribute_payload["requirements"] = requirements
 
-        return (
-            {"key": key, "value": "" if value is None else value, "requirements": requirement_ok},
-            extra_attrs,
-        )
+        return attribute_payload, extra_attrs
 
     def _build_dynamic_value(self, spec: Mapping[str, Any]) -> Tuple[Any, List[Dict[str, Any]]]:
         value_type = spec.get("type", "string")
@@ -281,6 +284,9 @@ class DatasetBuilder:
                     last = match.end()
                 parts.append(raw_value[last:])
                 resolved = "".join(parts)
+                attr["requirements_met"] = self._check_requirements(
+                    resolved, attr.get("requirements")
+                )
             resolved_values[key] = resolved
             return resolved
 
@@ -296,7 +302,7 @@ class DatasetBuilder:
             key = match.group("key")
             value = resolve_value(key)
             attr = attr_map.get(key)
-            requirements_met = True if attr is None else bool(attr.get("requirements", True))
+            requirements_met = True if attr is None else attr.get("requirements_met", True)
 
             if key in self.entity_keys and value and requirements_met:
                 start = cursor
