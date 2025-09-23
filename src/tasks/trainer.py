@@ -91,6 +91,7 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
                 "reference": doc.get("reference"),
                 "description": doc.get("description"),
                 "path": str(target_path),
+                "mapper": model.get("mapper"),
                 "status": "enabled",
             }
         )
