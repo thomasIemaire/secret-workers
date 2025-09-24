@@ -29,7 +29,13 @@ from transformers import (
     TrainingArguments,
 )
 
-from src.helpers.callbacks import MongoTrainLogger
+from .callbacks import MongoTrainLogger
+from .document import (
+    DocumentExtractionAgent,
+    DocumentSchema,
+    DocumentVocabulary,
+    save_descriptor,
+)
 
 try:  # pragma: no cover - optional dependency
     from peft import LoraConfig, TaskType, get_peft_model
@@ -210,6 +216,9 @@ def prepare_dataset(
     examples: Sequence[Mapping[str, Any]],
     label_names: Sequence[str],
     tokenizer: CamembertTokenizerFast,
+    *,
+    schema: Optional[DocumentSchema] = None,
+    vocabulary: Optional[DocumentVocabulary] = None,
 ) -> Tuple[Dataset, Dict[str, int], Dict[int, str], Dict[str, Any]]:
     label_names = _normalise_labels(label_names)
     label2id = {name: i for i, name in enumerate(label_names)}
@@ -288,6 +297,8 @@ def prepare_dataset(
         "texts": [example.text for example in cleaned_examples],
         "cleaning_stats": dict(stats),
         "schema": {"text": "str", "entities": "List[Tuple[int, int, str]]"},
+        "document_schema": schema.to_dict() if schema else None,
+        "document_vocabulary": vocabulary.to_metadata() if vocabulary else None,
     }
     return dataset, label2id, id2label, metadata
 
@@ -354,12 +365,47 @@ def trainer(
         raise ValueError("Dataset vide: aucune donnée à entraîner")
 
     parameters = parameters or {}
-    label_names = model.get("labels") or []
+    mapper_spec = model.get("mapper")
+    schema = DocumentSchema.from_mapping(mapper_spec)
+
+    raw_label_names = list(model.get("labels") or [])
+    if not raw_label_names and schema.entity_labels():
+        generated = []
+        for label in schema.entity_labels():
+            generated.append(f"B-{label}")
+            generated.append(f"I-{label}")
+        raw_label_names = [O_LABEL, *generated]
+
+    label_names = _normalise_labels(raw_label_names)
+    if len(label_names) <= 1:
+        raise ValueError("Aucune étiquette valide n'a été fournie pour l'entraînement")
+
     model_reference = model.get("reference", "model")
     resolved_version = version or model.get("version", "1.0")
 
-    tokenizer = CamembertTokenizerFast.from_pretrained(MODEL_NAME)
-    train_ds, label2id, id2label, metadata = prepare_dataset(dataset, label_names, tokenizer)
+    base_model_name = str(model.get("base_model") or MODEL_NAME)
+    tokenizer = CamembertTokenizerFast.from_pretrained(base_model_name)
+
+    additional_terms = model.get("vocabulary") or []
+    vocabulary = DocumentVocabulary.from_examples(dataset, additional_terms=additional_terms)
+    added_tokens = vocabulary.apply_to_tokenizer(tokenizer)
+    if added_tokens:
+        LOGGER.info("Vocabulaire documentaire: %s jetons ajoutés", added_tokens)
+
+    if schema.fields or schema.collections:
+        LOGGER.info(
+            "Schéma documentaire chargé: %s champs, %s collections",
+            len(schema.fields),
+            len(schema.collections),
+        )
+
+    train_ds, label2id, id2label, metadata = prepare_dataset(
+        dataset,
+        label_names,
+        tokenizer,
+        schema=schema,
+        vocabulary=vocabulary,
+    )
 
     LOGGER.info(
         "Schéma dataset: %s", metadata.get("schema", {"text": "str", "entities": "list"})
@@ -394,7 +440,7 @@ def trainer(
         parameters=parameters.get("continued_pretraining"),
     )
 
-    base_model_path = domain_pretraining_path or MODEL_NAME
+    base_model_path = domain_pretraining_path or base_model_name
 
     ner_model = CamembertForTokenClassification.from_pretrained(
         base_model_path,
@@ -492,6 +538,7 @@ def trainer(
     trainer_instance.save_model(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
 
+    threshold: Optional[float] = None
     if eval_dataset is not None:
         threshold = calibrate_probability_threshold(
             trainer_instance,
@@ -517,6 +564,31 @@ def trainer(
         parameters.get("active_learning"),
         output_dir=output_dir,
     )
+
+    thresholds_config = parameters.get("thresholds") if isinstance(parameters, Mapping) else None
+    if threshold is None:
+        if isinstance(thresholds_config, Mapping) and thresholds_config.get("default") is not None:
+            threshold = _ensure_float(thresholds_config.get("default"), 0.5)
+        else:
+            threshold = _ensure_float(parameters.get("default_threshold"), 0.5)
+
+    descriptor: Optional[dict[str, Any]] = None
+    if schema.fields or schema.collections:
+        descriptor = DocumentExtractionAgent(
+            name=model.get("name", model_reference),
+            schema=schema,
+            threshold=threshold,
+            vocabulary=vocabulary,
+            description=str(model.get("description", "")),
+        ).to_descriptor(base_model=str(base_model_path))
+        save_descriptor(output_dir / "agent.json", descriptor)
+        save_descriptor(output_dir / "schema.json", schema.to_dict())
+
+    if vocabulary is not None:
+        save_descriptor(output_dir / "vocabulary.json", vocabulary.to_metadata())
+
+    if descriptor is not None:
+        LOGGER.info("Descripteur d'agent enregistré dans %s", output_dir / "agent.json")
 
     if callback is not None:
         callback.close()

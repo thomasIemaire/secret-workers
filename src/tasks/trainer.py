@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -81,21 +82,36 @@ def run_task(*, doc: Optional[Mapping[str, Any]] = None, db=None, MAX_WORKERS: i
 
         target_path = Path("sardine.agents") / doc.get("reference", "agent") / version
 
-        agents.insert_one(
-            {
-                "created_by": doc.get("created_by"),
-                "created_at": datetime.utcnow(),
-                "model": model_id,
-                "version": version,
-                "name": doc.get("name"),
-                "reference": doc.get("reference"),
-                "description": doc.get("description"),
-                "path": str(target_path),
-                "mapper": model.get("mapper"),
-                "requirements": doc.get("requirements", []),
-                "status": "enabled",
-            }
-        )
+        descriptor_data: dict[str, Any] = {}
+        descriptor_path = target_path / "agent.json"
+        if descriptor_path.exists():
+            try:
+                descriptor_data = json.loads(descriptor_path.read_text(encoding="utf-8"))
+            except Exception as error:  # pragma: no cover - defensive logging
+                LOGGER.warning("Impossible de lire le descripteur d'agent: %s", error)
+                descriptor_data = {}
+
+        payload = {
+            "created_by": doc.get("created_by"),
+            "created_at": datetime.utcnow(),
+            "model": model_id,
+            "version": version,
+            "name": doc.get("name"),
+            "reference": doc.get("reference"),
+            "description": doc.get("description"),
+            "path": str(target_path),
+            "mapper": descriptor_data.get("schema") or model.get("mapper"),
+            "requirements": doc.get("requirements", []),
+            "status": "enabled",
+        }
+        if "threshold" in descriptor_data:
+            payload["confidence_threshold"] = descriptor_data.get("threshold")
+        if "vocabulary" in descriptor_data:
+            payload["vocabulary"] = descriptor_data.get("vocabulary")
+        if "base_model" in descriptor_data:
+            payload["base_model"] = descriptor_data.get("base_model")
+
+        agents.insert_one(payload)
 
         cleanup_checkpoints(target_path)
         LOGGER.info("[%s] entraînement terminé", job_id)
