@@ -196,11 +196,20 @@ sys.modules.setdefault(
     ),
 )
 
+from helpers.document import (
+    CompositeAgent,
+    DocumentExtractionAgent,
+    DocumentSchema,
+    DocumentVocabulary,
+)
 from helpers.trainer import O_LABEL, prepare_dataset
 
 
 class DummyTokenizer:
     """Tokenizer stub returning deterministic per-character offsets."""
+
+    def __init__(self) -> None:
+        self.added_tokens: list[str] = []
 
     def __call__(
         self,
@@ -235,6 +244,13 @@ class DummyTokenizer:
             "offset_mapping": offsets,
             "attention_mask": attention_mask,
         }
+
+    def add_tokens(self, tokens) -> int:  # pragma: no cover - simple stub
+        token_list = list(tokens)
+        if not token_list:
+            return 0
+        self.added_tokens.extend(token_list)
+        return len(token_list)
 
 
 class PrepareDatasetOverlapTests(unittest.TestCase):
@@ -283,6 +299,137 @@ class PrepareDatasetOverlapTests(unittest.TestCase):
         child_label_id = label2id["B-CHILD"]
         flattened = list(prepared[0]["labels"])
         self.assertIn(child_label_id, flattened)
+
+
+class DocumentSchemaMappingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        schema_mapping = {
+            "fields": [
+                {
+                    "name": "invoice_number",
+                    "label": "INVOICE_NUMBER",
+                    "path": ["invoice", "number"],
+                },
+                {
+                    "name": "customer_name",
+                    "label": "CUSTOMER_NAME",
+                    "path": ["customer", "name"],
+                },
+            ],
+            "collections": [
+                {
+                    "name": "lines",
+                    "path": ["invoice", "lines"],
+                    "fields": [
+                        {"name": "description", "label": "LINE_DESCRIPTION", "path": ["description"]},
+                        {"name": "quantity", "label": "LINE_QUANTITY", "path": ["quantity"]},
+                    ],
+                }
+            ],
+        }
+        self.schema = DocumentSchema.from_mapping(schema_mapping)
+        self.agent = DocumentExtractionAgent(name="invoice", schema=self.schema, threshold=0.5)
+
+    def test_schema_maps_predictions_to_json_structure(self) -> None:
+        predictions = [
+            {"label": "INVOICE_NUMBER", "text": "F2024-001", "score": 0.92, "start": 0, "end": 9},
+            {"label": "CUSTOMER_NAME", "text": "ACME", "score": 0.9, "start": 10, "end": 14},
+            {"label": "LINE_DESCRIPTION", "text": "Service A", "score": 0.85, "start": 20, "end": 29, "group": 0},
+            {"label": "LINE_QUANTITY", "text": "2", "score": 0.8, "start": 30, "end": 31, "group": 0},
+            {"label": "LINE_DESCRIPTION", "text": "Service B", "score": 0.88, "start": 40, "end": 49, "group": 1},
+        ]
+
+        result = self.agent.map_predictions(predictions)
+
+        self.assertEqual(result["invoice"]["number"]["value"], "F2024-001")
+        self.assertGreater(result["invoice"]["number"]["confidence"], 0.9)
+        self.assertEqual(result["customer"]["name"]["value"], "ACME")
+
+        lines = result["invoice"]["lines"]
+        self.assertEqual(len(lines), 2)
+        first_line = lines[0]
+        self.assertEqual(first_line["description"]["value"], "Service A")
+        self.assertEqual(first_line["quantity"]["value"], "2")
+        self.assertAlmostEqual(first_line["_confidence"], (0.85 + 0.8) / 2, places=4)
+        self.assertEqual(first_line["_row_id"], 0)
+        self.assertEqual(first_line["description"]["provenance"]["metadata"]["group"], 0)
+
+        second_line = lines[1]
+        self.assertEqual(second_line["description"]["value"], "Service B")
+        self.assertIsNone(second_line["quantity"]["value"])
+        self.assertAlmostEqual(second_line["_confidence"], 0.88, places=4)
+
+
+class DocumentVocabularyTests(unittest.TestCase):
+    def test_vocabulary_includes_domain_terms_and_applies_to_tokenizer(self) -> None:
+        examples = [
+            {"data": {"text": "Facture adressée à Mme Dupont 75001 Paris"}},
+            {"data": {"text": "Total facture 1200 EUR payé par virement bancaire"}},
+        ]
+        vocabulary = DocumentVocabulary.from_examples(examples, additional_terms=["référence"])
+        metadata = vocabulary.to_metadata()
+
+        self.assertIn("facture", metadata["tokens"])
+        self.assertIn("référence", metadata["tokens"])
+        self.assertGreaterEqual(metadata["size"], len(DocumentVocabulary.DEFAULT_TERMS))
+
+        tokenizer = DummyTokenizer()
+        added = vocabulary.apply_to_tokenizer(tokenizer)
+        self.assertEqual(added, len(vocabulary.tokens))
+        self.assertEqual(tokenizer.added_tokens, vocabulary.tokens)
+
+
+class CompositeAgentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        address_schema = DocumentSchema.from_mapping(
+            {
+                "fields": [
+                    {
+                        "name": "company_address",
+                        "label": "ADDRESS",
+                        "path": ["company", "address"],
+                    }
+                ]
+            }
+        )
+        lines_schema = DocumentSchema.from_mapping(
+            {
+                "collections": [
+                    {
+                        "name": "lines",
+                        "path": ["invoice", "lines"],
+                        "fields": [
+                            {"name": "description", "label": "LINE_DESCRIPTION", "path": ["description"]},
+                            {"name": "quantity", "label": "LINE_QUANTITY", "path": ["quantity"]},
+                        ],
+                    }
+                ]
+            }
+        )
+        self.address_agent = DocumentExtractionAgent(name="adresse", schema=address_schema, threshold=0.4)
+        self.lines_agent = DocumentExtractionAgent(name="lignes", schema=lines_schema, threshold=0.4)
+        self.composite = CompositeAgent([self.address_agent, self.lines_agent])
+
+    def test_composite_merges_outputs_using_best_confidence(self) -> None:
+        predictions = {
+            "adresse": [
+                {"label": "ADDRESS", "text": "12 rue Bleue", "score": 0.6, "start": 0, "end": 12},
+                {"label": "ADDRESS", "text": "14 rue Verte", "score": 0.95, "start": 0, "end": 12},
+            ],
+            "lignes": [
+                {"label": "LINE_DESCRIPTION", "text": "Produit A", "score": 0.7, "start": 20, "end": 29, "group": 0},
+                {"label": "LINE_QUANTITY", "text": "5", "score": 0.65, "start": 30, "end": 31, "group": 0},
+            ],
+        }
+
+        result = self.composite.combine(predictions)
+
+        self.assertEqual(result["company"]["address"]["value"], "14 rue Verte")
+        lines = result["invoice"]["lines"]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["description"]["value"], "Produit A")
+        self.assertEqual(lines[0]["quantity"]["value"], "5")
+        self.assertAlmostEqual(lines[0]["_confidence"], (0.7 + 0.65) / 2, places=4)
 
 
 if __name__ == "__main__":
