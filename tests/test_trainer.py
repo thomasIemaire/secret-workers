@@ -1,132 +1,75 @@
-"""Tests for the trainer dataset preparation helpers."""
-
-from __future__ import annotations
-
-import os
+import pathlib
 import sys
 import types
 import unittest
 
-
-def _load_metric(_name: str):
-    class _Metric:
-        def compute(self, predictions, references):  # pragma: no cover - simple stub
-            return {}
-
-    return _Metric()
-
-
-# Provide a lightweight stand-in for the optional ``evaluate`` dependency so that
-# importing ``helpers.trainer`` during the tests does not require the real package.
-sys.modules.setdefault("evaluate", types.SimpleNamespace(load=_load_metric))
-sys.modules.setdefault("dotenv", types.SimpleNamespace(load_dotenv=lambda *args, **kwargs: None))
-
-
-class _DummyCollection:
-    def update_one(self, *args, **kwargs):  # pragma: no cover - stub
-        return None
-
-    def find_one_and_update(self, *args, **kwargs):  # pragma: no cover - stub
-        return None
-
-
-class _DummyDatabase:
-    def __getitem__(self, _name):  # pragma: no cover - stub
-        return _DummyCollection()
-
-    def get_collection(self, _name):  # pragma: no cover - stub
-        return _DummyCollection()
-
-
-class _DummyMongoClient:
-    def __init__(self, *args, **kwargs):  # pragma: no cover - stub
-        pass
-
-    def get_database(self):  # pragma: no cover - stub
-        return _DummyDatabase()
-
-    def close(self):  # pragma: no cover - stub
-        return None
-
-
-sys.modules.setdefault(
-    "pymongo",
-    types.SimpleNamespace(MongoClient=_DummyMongoClient, ReturnDocument=types.SimpleNamespace(AFTER="after")),
-)
-sys.modules.setdefault("bson", types.SimpleNamespace(ObjectId=lambda value: value))
-os.environ.setdefault("MONGO_URI", "mongodb://localhost:27017")
-
-
-class _DummyNumpy(types.SimpleNamespace):
-    def __init__(self) -> None:
-        super().__init__(argmax=self._argmax, ndarray=list)
-
-    @staticmethod
-    def _argmax(array, axis=None):  # pragma: no cover - simple stub
-        return 0
-
-
-sys.modules.setdefault("numpy", _DummyNumpy())
-
-
-class _DummyTensor:
-    def __init__(self, data):
-        self._data = data
-
-    def numpy(self):  # pragma: no cover - simple stub
-        return self._data
-
-
-class _DummyTorch(types.SimpleNamespace):
-    def __init__(self) -> None:
-        super().__init__(
-            cuda=types.SimpleNamespace(is_available=lambda: False),
-            tensor=lambda data: _DummyTensor(data),
-            softmax=lambda tensor, dim=-1: tensor,
-            qint8=object(),
-            float16=object(),
-            quantization=types.SimpleNamespace(quantize_dynamic=lambda model, modules, dtype: model),
-            nn=types.SimpleNamespace(Linear=object),
-        )
-
-
-sys.modules.setdefault("torch", _DummyTorch())
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 
 class _DummyDataset:
-    def __init__(self, records):
-        self._records = list(records)
+    def __init__(self, data):
+        self.data = data
 
     @classmethod
-    def from_list(cls, records):  # pragma: no cover - simple stub
-        return cls(records)
-
-    def __len__(self):  # pragma: no cover - simple stub
-        return len(self._records)
-
-    def __getitem__(self, index):  # pragma: no cover - simple stub
-        return self._records[index]
-
-    def select(self, indices):  # pragma: no cover - simple stub
-        return _DummyDataset(self._records[i] for i in indices)
-
-    def train_test_split(self, test_size=0.0, seed=None):  # pragma: no cover - simple stub
-        return {"train": self, "test": self}
+    def from_dict(cls, data):  # pragma: no cover - simple stub
+        return cls(data)
 
 
-sys.modules.setdefault("datasets", types.SimpleNamespace(Dataset=_DummyDataset))
+class _DummyTokenizer:
+    cls_token_id = 0
 
+    def __init__(self):
+        self._sequence_ids = []
 
-sys.modules.setdefault(
-    "seqeval.metrics",
-    types.SimpleNamespace(
-        classification_report=lambda *args, **kwargs: "",  # pragma: no cover - stub
-        f1_score=lambda *args, **kwargs: 0.0,  # pragma: no cover - stub
-        precision_score=lambda *args, **kwargs: 0.0,  # pragma: no cover - stub
-        recall_score=lambda *args, **kwargs: 0.0,  # pragma: no cover - stub
-    ),
-)
-sys.modules.setdefault("seqeval.scheme", types.SimpleNamespace(IOB2=object()))
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):  # pragma: no cover - stub
+        return cls()
+
+    def save_pretrained(self, *args, **kwargs):  # pragma: no cover - stub
+        return None
+
+    def __call__(
+        self,
+        questions,
+        contexts,
+        *,
+        truncation,
+        max_length,
+        stride,
+        return_overflowing_tokens,
+        return_offsets_mapping,
+        padding,
+    ):
+        batch = len(questions)
+        input_ids = []
+        attention_mask = []
+        offset_mapping = []
+        sequence_ids = []
+        for question, context in zip(questions, contexts):
+            # Very small deterministic tokenisation: every character is a token.
+            q_tokens = [(0, 0)] * (len(question) + 2)
+            c_offsets = []
+            for index, _ in enumerate(context):
+                c_offsets.append((index, index + 1))
+            offsets = q_tokens + c_offsets + [(0, 0)]
+            ids = list(range(len(offsets)))
+            mask = [1] * len(offsets)
+            sid = [0] * len(q_tokens) + [1] * len(c_offsets) + [0]
+            input_ids.append(ids)
+            attention_mask.append(mask)
+            offset_mapping.append(offsets)
+            sequence_ids.append(sid)
+        self._sequence_ids = sequence_ids
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "overflow_to_sample_mapping": list(range(batch)),
+            "offset_mapping": offset_mapping,
+        }
+
+    def sequence_ids(self, index):  # pragma: no cover - stub
+        return self._sequence_ids[index]
 
 
 class _DummyModel:
@@ -138,26 +81,9 @@ class _DummyModel:
         return None
 
 
-class _DummyTokenizer:
-    @classmethod
-    def from_pretrained(cls, *args, **kwargs):  # pragma: no cover - stub
-        return cls()
-
-    def save_pretrained(self, *args, **kwargs):  # pragma: no cover - stub
-        return None
-
-
-class _DummyTrainingArguments:
-    def __init__(self, *args, **kwargs):  # pragma: no cover - stub
-        self.kwargs = kwargs
-
-
 class _DummyTrainer:
     def __init__(self, *args, **kwargs):  # pragma: no cover - stub
-        pass
-
-    def add_callback(self, _callback):  # pragma: no cover - stub
-        return None
+        self.kwargs = kwargs
 
     def train(self):  # pragma: no cover - stub
         return None
@@ -166,124 +92,159 @@ class _DummyTrainer:
         return None
 
 
-class _DummyEarlyStoppingCallback:
+class _DummyTrainingArguments:
     def __init__(self, *args, **kwargs):  # pragma: no cover - stub
         self.kwargs = kwargs
 
 
-class _DummySchedulerType(str):
-    LINEAR = "linear"
-
-    def __new__(cls, value="linear"):  # pragma: no cover - stub
-        if value != cls.LINEAR:
-            raise ValueError(value)
-        return str.__new__(cls, value)
-
-
+sys.modules.setdefault("datasets", types.SimpleNamespace(Dataset=_DummyDataset))
 sys.modules.setdefault(
     "transformers",
     types.SimpleNamespace(
-        CamembertForMaskedLM=_DummyModel,
-        CamembertForTokenClassification=_DummyModel,
-        CamembertTokenizerFast=_DummyTokenizer,
-        DataCollatorForLanguageModeling=_DummyModel,
-        DataCollatorForTokenClassification=_DummyModel,
-        EarlyStoppingCallback=_DummyEarlyStoppingCallback,
-        TrainerCallback=type("TrainerCallback", (), {}),
-        SchedulerType=_DummySchedulerType,
+        AutoTokenizer=_DummyTokenizer,
+        AutoModelForQuestionAnswering=_DummyModel,
+        DataCollatorWithPadding=lambda tokenizer: None,
         Trainer=_DummyTrainer,
         TrainingArguments=_DummyTrainingArguments,
     ),
 )
 
-from helpers.trainer import O_LABEL, prepare_dataset
+from helpers.trainer import DocumentSchema, FieldPrediction, build_qa_examples
 
 
-class DummyTokenizer:
-    """Tokenizer stub returning deterministic per-character offsets."""
-
-    def __call__(
-        self,
-        text: str,
-        *,
-        return_offsets_mapping: bool,
-        truncation: bool,
-        max_length: int,
-    ) -> dict:
-        if not return_offsets_mapping:
-            raise ValueError("DummyTokenizer requires return_offsets_mapping=True")
-
-        offsets = [(0, 0)]
-        input_ids = [0]
-        attention_mask = [1]
-
-        for index, _ in enumerate(text):
-            # Use one token per character to keep offsets simple and predictable.
-            start = index
-            end = index + 1
-            offsets.append((start, end))
-            input_ids.append(index + 1)
-            attention_mask.append(1)
-
-        # Trailing special token, mirroring fast tokenizers that include </s>.
-        offsets.append((0, 0))
-        input_ids.append(len(text) + 1)
-        attention_mask.append(1)
-
-        return {
-            "input_ids": input_ids,
-            "offset_mapping": offsets,
-            "attention_mask": attention_mask,
+class DocumentSchemaTests(unittest.TestCase):
+    def test_schema_extracts_fields_and_vocabulary(self) -> None:
+        mapper = {
+            "invoice": {
+                "number": "INVOICE_NUMBER",
+                "lines": [
+                    {
+                        "description": {
+                            "label": "LINE_DESCRIPTION",
+                            "synonyms": ["libellé"],
+                        },
+                        "quantity": "LINE_QUANTITY",
+                    }
+                ],
+            },
+            "address": {"city": "ADDRESS_CITY"},
         }
 
+        schema = DocumentSchema.from_mapping(mapper, language="fr")
 
-class PrepareDatasetOverlapTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.label_names = [
-            O_LABEL,
-            "B-PARENT",
-            "I-PARENT",
-            "B-CHILD",
-            "I-CHILD",
-        ]
-        self.tokenizer = DummyTokenizer()
+        self.assertIn("INVOICE_NUMBER", schema.labels_for_path(["invoice"]))
+        self.assertIn("LINE_QUANTITY", schema.labels_for_path(["invoice", "lines"]))
+        field = schema.get("LINE_DESCRIPTION")
+        self.assertIsNotNone(field)
+        assert field is not None
+        self.assertIn("libellé", field.synonyms)
+        self.assertTrue(field.cardinality == "multi")
+        vocabulary = set(schema.vocabulary)
+        self.assertIn("invoice", vocabulary)
+        self.assertIn("number", vocabulary)
+        self.assertIn("libellé", vocabulary)
 
-    def test_prepare_dataset_detects_overlapping_entities(self) -> None:
-        overlapping = [
-            {
-                "data": {
-                    "text": "TVA FR123456789",
-                    "entities": [
-                        [4, 15, "PARENT"],
-                        [6, 15, "CHILD"],
-                    ],
-                }
-            }
-        ]
 
-        with self.assertRaisesRegex(ValueError, "Les entités qui se chevauchent"):
-            prepare_dataset(overlapping, self.label_names, self.tokenizer)
+class BuildQAExamplesTests(unittest.TestCase):
+    def test_examples_created_for_entities(self) -> None:
+        mapper = {
+            "invoice": {
+                "number": "INVOICE_NUMBER",
+                "lines": [
+                    {
+                        "quantity": "LINE_QUANTITY",
+                    }
+                ],
+            },
+            "address": {"city": "ADDRESS_CITY"},
+        }
+        schema = DocumentSchema.from_mapping(mapper)
 
-    def test_prepare_dataset_accepts_non_overlapping_entities(self) -> None:
+        text = "Facture F-123\nQuantité: 10\nVille: Paris"
+        number_start = text.index("F-123")
+        quantity_start = text.index("10")
+        city_start = text.index("Paris")
         dataset = [
             {
+                "_id": "doc1",
                 "data": {
-                    "text": "SIREN 123456789",
+                    "text": text,
                     "entities": [
-                        [6, 15, "CHILD"],
+                        [number_start, number_start + 5, "INVOICE_NUMBER"],
+                        [quantity_start, quantity_start + 2, "LINE_QUANTITY"],
+                        [city_start, city_start + 5, "ADDRESS_CITY"],
                     ],
-                }
+                },
             }
         ]
 
-        prepared, label2id, _, _ = prepare_dataset(dataset, self.label_names, self.tokenizer)
+        examples = build_qa_examples(dataset, schema)
 
-        self.assertEqual(len(prepared), 1)
-        # Ensure the correct tag is present in the encoded labels.
-        child_label_id = label2id["B-CHILD"]
-        flattened = list(prepared[0]["labels"])
-        self.assertIn(child_label_id, flattened)
+        labels = {example["label"] for example in examples}
+        self.assertEqual(len(examples), 3)
+        self.assertIn("INVOICE_NUMBER", labels)
+        self.assertIn("LINE_QUANTITY", labels)
+        self.assertIn("ADDRESS_CITY", labels)
+        invoice_example = next(example for example in examples if example["label"] == "INVOICE_NUMBER")
+        self.assertIn("Facture", invoice_example["context"])
+        self.assertIn("valeur", invoice_example["question"].lower())
 
 
-if __name__ == "__main__":
+class AggregationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        mapper = {
+            "invoice": {
+                "number": "INVOICE_NUMBER",
+                "lines": [
+                    {
+                        "quantity": "LINE_QUANTITY",
+                    }
+                ],
+            },
+            "address": {"city": "ADDRESS_CITY"},
+        }
+        self.schema = DocumentSchema.from_mapping(mapper)
+
+    def test_highest_confidence_is_kept(self) -> None:
+        result = self.schema.aggregate_predictions(
+            [
+                FieldPrediction(label="INVOICE_NUMBER", value="F-123", confidence=0.91),
+                FieldPrediction(label="INVOICE_NUMBER", value="F-124", confidence=0.5),
+            ]
+        )
+        invoice = result["invoice"]["number"]
+        self.assertEqual(invoice["value"], "F-123")
+        self.assertAlmostEqual(invoice["confidence"], 0.91)
+
+    def test_list_predictions_respect_positions(self) -> None:
+        predictions = [
+            FieldPrediction(
+                label="LINE_QUANTITY",
+                value="11",
+                confidence=0.9,
+                position=0,
+            ),
+            FieldPrediction(
+                label="LINE_QUANTITY",
+                value="8",
+                confidence=0.65,
+                position=1,
+            ),
+            FieldPrediction(
+                label="ADDRESS_CITY",
+                value="Paris",
+                confidence=0.83,
+            ),
+        ]
+        result = self.schema.aggregate_predictions(predictions)
+        invoice = result["invoice"]
+        lines = invoice["lines"]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0]["quantity"]["value"], "11")
+        self.assertEqual(lines[1]["quantity"]["confidence"], 0.65)
+        self.assertEqual(result["address"]["city"]["value"], "Paris")
+
+
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+

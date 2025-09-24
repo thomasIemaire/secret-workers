@@ -1,345 +1,524 @@
-"""Training utilities for sequence tagging models."""
+"""Training utilities for LayoutLM-based document extraction agents.
+
+This module restructures the training helpers around a document question
+answering workflow.  The goal is to make it easy to fine-tune a
+pretrained LayoutLM model on document datasets, expose a document oriented
+vocabulary, and aggregate predictions into JSON structures with
+confidence scores.  Agents that specialise on a subset of fields can be
+trained independently and their outputs later merged together.
+"""
 
 from __future__ import annotations
 
-import json
 import logging
-import os
-from collections import Counter
-from dataclasses import dataclass
-from pathlib import Path
-from statistics import mean
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
-import evaluate
-import numpy as np
-import torch
 from datasets import Dataset
-from seqeval.metrics import classification_report, f1_score, precision_score, recall_score
-from seqeval.scheme import IOB2
 from transformers import (
-    CamembertForMaskedLM,
-    CamembertForTokenClassification,
-    CamembertTokenizerFast,
-    DataCollatorForLanguageModeling,
-    DataCollatorForTokenClassification,
-    EarlyStoppingCallback,
-    SchedulerType,
+    AutoModelForQuestionAnswering,
+    AutoTokenizer,
+    DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
 )
 
-from src.helpers.callbacks import MongoTrainLogger
-
-try:  # pragma: no cover - optional dependency
-    from peft import LoraConfig, TaskType, get_peft_model
-
-    PEFT_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional dependency
-    LoraConfig = TaskType = get_peft_model = None
-    PEFT_AVAILABLE = False
-
 LOGGER = logging.getLogger(__name__)
-MODEL_NAME = "camembert-base"
-MAX_SEQ_LENGTH = 512
-O_LABEL = "O"
+
+MODEL_NAME = "impira/layoutlm-document-qa"
+MAX_SEQ_LENGTH = 384
+DOC_STRIDE = 128
+TERMINAL_KEYS = {
+    "label",
+    "question",
+    "vocabulary",
+    "synonyms",
+    "cardinality",
+    "position",
+    "language",
+}
 
 
-@dataclass
-class CleanedExample:
-    """Representation of a validated training example."""
+@dataclass(frozen=True)
+class PathSegment:
+    """Represents a segment in a JSON path."""
 
-    text: str
-    entities: List[Tuple[int, int, str]]
-    original: Mapping[str, Any]
+    name: str
+    kind: str = "object"  # "object", "list", or "field"
 
-
-def _normalise_labels(label_names: Sequence[str]) -> List[str]:
-    unique = []
-    seen = set()
-    for label in label_names:
-        if label not in seen:
-            unique.append(label)
-            seen.add(label)
-
-    if O_LABEL not in seen:
-        unique.insert(0, O_LABEL)
-        seen.add(O_LABEL)
-
-    others = sorted(label for label in unique if label != O_LABEL)
-    return [O_LABEL, *others]
+    def __post_init__(self) -> None:
+        if self.kind not in {"object", "list", "field"}:
+            raise ValueError(f"Type de segment inconnu: {self.kind}")
 
 
-def _ensure_int(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+@dataclass(frozen=True)
+class FieldSpec:
+    """Metadata describing a field that should be extracted."""
 
+    label: str
+    path: Tuple[PathSegment, ...]
+    question: str
+    vocabulary: Tuple[str, ...]
+    cardinality: str = "single"
+    synonyms: Tuple[str, ...] = field(default_factory=tuple)
 
-def _ensure_float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+    def __post_init__(self) -> None:
+        if not self.label:
+            raise ValueError("Chaque champ doit avoir un identifiant")
+        if not self.path:
+            raise ValueError("Un champ doit être associé à un chemin JSON")
+        if self.cardinality not in {"single", "multi"}:
+            raise ValueError("Cardinalité inconnue: %s" % self.cardinality)
 
+    @property
+    def container(self) -> Tuple[PathSegment, ...]:
+        """Return the path leading to the parent container."""
 
-def _ensure_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    if value is None:
-        return default
-    return bool(value)
+        return self.path[:-1]
 
+    @property
+    def leaf(self) -> PathSegment:
+        return self.path[-1]
 
-def _resolve_scheduler_type(value: Any) -> SchedulerType:
-    if isinstance(value, SchedulerType):
-        return value
-
-    if value is None:
-        return SchedulerType.LINEAR
-
-    try:
-        scheduler_value = str(value).strip()
-    except Exception:
-        scheduler_value = ""
-
-    if not scheduler_value:
-        return SchedulerType.LINEAR
-
-    try:
-        return SchedulerType(scheduler_value.lower())
-    except ValueError:
-        LOGGER.warning(
-            "Type de scheduler invalide '%s', utilisation de 'linear'",
-            value,
+    def with_path(self, new_path: Sequence[PathSegment]) -> "FieldSpec":
+        return FieldSpec(
+            label=self.label,
+            path=tuple(new_path),
+            question=self.question,
+            vocabulary=self.vocabulary,
+            cardinality=self.cardinality,
+            synonyms=self.synonyms,
         )
-        return SchedulerType.LINEAR
 
 
-def _sanitize_for_json(value: Any) -> Any:
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    if isinstance(value, Mapping):
-        return {key: _sanitize_for_json(val) for key, val in value.items()}
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_sanitize_for_json(item) for item in value]
-    return str(value)
+@dataclass(frozen=True)
+class FieldPrediction:
+    """Prediction returned by a specialised agent."""
+
+    label: str
+    value: str
+    confidence: float
+    position: Optional[int] = None
+    metadata: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        confidence = 0.0 if self.confidence is None else float(self.confidence)
+        confidence = max(0.0, min(1.0, confidence))
+        object.__setattr__(self, "confidence", confidence)
+        if self.position is not None and self.position < 0:
+            object.__setattr__(self, "position", 0)
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "FieldPrediction":
+        return cls(
+            label=str(payload.get("label")),
+            value=str(payload.get("value", "")),
+            confidence=float(payload.get("confidence", 0.0)),
+            position=payload.get("position"),
+            metadata=payload.get("metadata"),
+        )
 
 
-def _clean_examples(
-    examples: Sequence[Mapping[str, Any]],
-    *,
-    allowed_labels: Iterable[str],
-) -> Tuple[List[CleanedExample], Counter]:
-    """Validate and deduplicate raw dataset entries."""
+class DocumentSchema:
+    """Schema describing how to extract fields from a document."""
 
-    allowed = {
-        label.split("-", 1)[-1] if label.startswith(("B-", "I-")) else label
-        for label in allowed_labels
-    }
-    cleaned: List[CleanedExample] = []
-    stats: Counter = Counter()
-    seen_examples: set[Tuple[str, Tuple[Tuple[int, int, str], ...]]] = set()
+    def __init__(self, fields: Sequence[FieldSpec], *, language: str = "fr") -> None:
+        if not fields:
+            raise ValueError("Le mapper du modèle ne contient aucun champ")
+        self.language = language
+        self.fields: Tuple[FieldSpec, ...] = tuple(fields)
+        self._field_by_label: Dict[str, FieldSpec] = {
+            field.label: field for field in self.fields
+        }
+        vocabulary: set[str] = set()
+        for field in self.fields:
+            vocabulary.update(field.vocabulary)
+        self.vocabulary: Tuple[str, ...] = tuple(sorted(vocabulary))
 
-    for example in examples:
-        data = example.get("data") or {}
-        text = data.get("text", "")
-        if not isinstance(text, str):
-            text = str(text)
-        text = text.strip()
-        if not text:
-            stats["empty_text"] += 1
-            continue
+    @classmethod
+    def from_mapping(
+        cls,
+        mapping: Mapping[str, Any],
+        *,
+        language: str = "fr",
+    ) -> "DocumentSchema":
+        fields = list(_collect_fields(mapping, language=language))
+        return cls(fields, language=language)
 
-        normalised_text = " ".join(text.split())
-        entities = data.get("entities") or []
-        cleaned_entities: List[Tuple[int, int, str]] = []
-        for raw in entities:
-            try:
-                start, end, label = raw
-            except (TypeError, ValueError):
-                stats["malformed_entity"] += 1
+    def get(self, label: str) -> Optional[FieldSpec]:
+        return self._field_by_label.get(label)
+
+    def labels_for_path(self, path: Sequence[str]) -> List[str]:
+        prefix = tuple(path)
+        matches: List[str] = []
+        for field in self.fields:
+            container_names = tuple(segment.name for segment in field.container)
+            if container_names[: len(prefix)] == prefix:
+                matches.append(field.label)
+        return matches
+
+    def as_mapping(self) -> Dict[str, Any]:
+        root: Dict[str, Any] = {}
+        for field in self.fields:
+            cursor: MutableMapping[str, Any] | List[Any]
+            cursor = root
+            for segment in field.container:
+                if segment.kind == "object":
+                    cursor = cursor.setdefault(segment.name, {})  # type: ignore[assignment]
+                elif segment.kind == "list":
+                    items = cursor.setdefault(segment.name, [{}])  # type: ignore[assignment]
+                    if not items:
+                        items.append({})
+                    cursor = items[0]  # type: ignore[index]
+            leaf_name = field.leaf.name
+            if isinstance(cursor, list):
+                cursor = cursor[0]  # pragma: no cover - defensive
+            cursor[leaf_name] = field.label  # type: ignore[index]
+        return root
+
+    def aggregate_predictions(
+        self, *prediction_groups: Iterable[FieldPrediction] | FieldPrediction
+    ) -> Dict[str, Any]:
+        flat_predictions: List[FieldPrediction] = []
+        for group in prediction_groups:
+            if group is None:
+                continue
+            if isinstance(group, FieldPrediction):
+                flat_predictions.append(group)
+                continue
+            for prediction in group:
+                if isinstance(prediction, FieldPrediction):
+                    flat_predictions.append(prediction)
+                elif isinstance(prediction, Mapping):
+                    flat_predictions.append(FieldPrediction.from_mapping(prediction))
+                else:  # pragma: no cover - defensive
+                    raise TypeError(
+                        "Predictions must be FieldPrediction instances or mappings"
+                    )
+
+        flat_predictions.sort(key=lambda pred: pred.confidence, reverse=True)
+
+        result: Dict[str, Any] = {}
+
+        for prediction in flat_predictions:
+            field = self.get(prediction.label)
+            if field is None:
+                LOGGER.debug("Étiquette inconnue ignorée: %s", prediction.label)
+                continue
+            if not prediction.value:
                 continue
 
+            cursor: Any = result
+            list_cursors: List[Tuple[List[Any], int]] = []
+
+            for segment in field.container:
+                if segment.kind == "object":
+                    cursor = cursor.setdefault(segment.name, {})
+                elif segment.kind == "list":
+                    position = prediction.position
+                    if not isinstance(cursor.get(segment.name), list):
+                        cursor[segment.name] = []
+                    cursor_list = cursor[segment.name]
+                    if position is None:
+                        position = len(cursor_list)
+                    while len(cursor_list) <= position:
+                        cursor_list.append({})
+                    list_cursors.append((cursor_list, position))
+                    cursor = cursor_list[position]
+
+            leaf_name = field.leaf.name
+            existing = cursor.get(leaf_name)
+            if isinstance(existing, Mapping) and existing.get("confidence", -1) >= prediction.confidence:
+                continue
+            cursor[leaf_name] = {
+                "value": prediction.value,
+                "confidence": prediction.confidence,
+            }
+
+            for cursor_list, position in list_cursors:
+                if position is None:
+                    continue
+                cursor_list[position] = _prune_empty(cursor_list[position]) or {}
+
+        return _prune_empty(result) or {}
+
+
+def _tokenize_identifier(identifier: str) -> List[str]:
+    tokens = re.split(r"[^\w]+", identifier, flags=re.UNICODE)
+    return [token.lower() for token in tokens if token]
+
+
+def _humanise_identifier(identifier: str) -> str:
+    tokens = _tokenize_identifier(identifier)
+    if not tokens:
+        return identifier.lower()
+    return " ".join(tokens)
+
+
+def _generate_question(path: Sequence[PathSegment], *, language: str) -> str:
+    field_name = _humanise_identifier(path[-1].name)
+    context = " ".join(_humanise_identifier(segment.name) for segment in path[:-1])
+    if language.lower().startswith("fr"):
+        if context:
+            return f"Quelle est la valeur de {field_name} dans {context} ?"
+        return f"Quelle est la valeur de {field_name} ?"
+    if context:
+        return f"What is the value of {field_name} in {context}?"
+    return f"What is the value of {field_name}?"
+
+
+def _collect_vocabulary(
+    path: Sequence[PathSegment],
+    *,
+    label: str,
+    synonyms: Sequence[str],
+) -> Tuple[str, ...]:
+    vocab: set[str] = set()
+    for segment in path:
+        vocab.update(_tokenize_identifier(segment.name))
+    vocab.update(_tokenize_identifier(label))
+    for synonym in synonyms:
+        vocab.update(_tokenize_identifier(str(synonym)))
+    return tuple(sorted(vocab))
+
+
+def _is_terminal_mapping(value: Mapping[str, Any]) -> bool:
+    return any(key in TERMINAL_KEYS for key in value.keys())
+
+
+def _build_field_spec(
+    *,
+    prefix: Tuple[PathSegment, ...],
+    key: str,
+    value: Any,
+    language: str,
+) -> FieldSpec:
+    if isinstance(value, Mapping) and _is_terminal_mapping(value):
+        label = str(value.get("label"))
+        question = value.get("question")
+        synonyms = tuple(value.get("synonyms") or ())
+        vocabulary_override = value.get("vocabulary")
+        cardinality = value.get("cardinality") or "multi" if any(
+            segment.kind == "list" for segment in prefix
+        ) else "single"
+    else:
+        label = str(value)
+        question = None
+        synonyms = ()
+        vocabulary_override = None
+        cardinality = "multi" if any(segment.kind == "list" for segment in prefix) else "single"
+
+    path = prefix + (PathSegment(name=key, kind="field"),)
+    resolved_question = question or _generate_question(path, language=language)
+    if vocabulary_override:
+        vocabulary = tuple({str(token).lower() for token in vocabulary_override})
+    else:
+        vocabulary = _collect_vocabulary(path, label=label, synonyms=synonyms)
+    return FieldSpec(
+        label=label,
+        path=path,
+        question=resolved_question,
+        vocabulary=vocabulary,
+        cardinality=cardinality,
+        synonyms=synonyms,
+    )
+
+
+def _collect_fields(
+    mapping: Mapping[str, Any],
+    *,
+    language: str,
+    prefix: Tuple[PathSegment, ...] = (),
+) -> Iterator[FieldSpec]:
+    for key, value in mapping.items():
+        if isinstance(value, Mapping) and not _is_terminal_mapping(value):
+            new_prefix = prefix + (PathSegment(name=str(key), kind="object"),)
+            yield from _collect_fields(value, language=language, prefix=new_prefix)
+            continue
+        if isinstance(value, list):
+            if not value:
+                continue
+            first = value[0]
+            new_prefix = prefix + (PathSegment(name=str(key), kind="list"),)
+            if isinstance(first, Mapping):
+                yield from _collect_fields(first, language=language, prefix=new_prefix)
+            else:
+                yield _build_field_spec(
+                    prefix=new_prefix,
+                    key=str(key),
+                    value=first,
+                    language=language,
+                )
+            continue
+        yield _build_field_spec(
+            prefix=prefix,
+            key=str(key),
+            value=value,
+            language=language,
+        )
+
+
+def _prune_empty(value: Any) -> Any:
+    if isinstance(value, dict):
+        pruned: Dict[str, Any] = {}
+        for key, child in value.items():
+            child_pruned = _prune_empty(child)
+            if child_pruned is not None:
+                pruned[key] = child_pruned
+        return pruned or None
+    if isinstance(value, list):
+        new_list = []
+        for element in value:
+            child_pruned = _prune_empty(element)
+            if child_pruned is not None:
+                new_list.append(child_pruned)
+        return new_list or None
+    return value
+
+
+def build_qa_examples(
+    dataset: Sequence[Mapping[str, Any]],
+    schema: DocumentSchema,
+) -> List[Dict[str, Any]]:
+    qa_examples: List[Dict[str, Any]] = []
+    for index, record in enumerate(dataset):
+        payload = record.get("data") or {}
+        text = payload.get("text", "")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        entities = payload.get("entities") or []
+        for entity_index, raw_entity in enumerate(entities):
+            try:
+                start, end, label = raw_entity
+            except (TypeError, ValueError):
+                continue
+            field = schema.get(str(label))
+            if field is None:
+                continue
             try:
                 start = int(start)
                 end = int(end)
             except (TypeError, ValueError):
-                stats["non_numeric_span"] += 1
                 continue
-
-            if end <= start:
-                stats["invalid_span"] += 1
-                continue
-
-            raw_label = str(label or "").strip()
-            base_label = raw_label.split("-", 1)[-1]
-            if not base_label or base_label not in allowed:
-                stats["unknown_label"] += 1
-                continue
-
             start = max(0, start)
-            end = min(len(normalised_text), end)
-            if start >= end:
-                stats["out_of_bounds"] += 1
+            end = min(len(text), end)
+            if end <= start:
                 continue
-
-            cleaned_entities.append((start, end, base_label))
-
-        cleaned_entities.sort()
-        dedup_key = (normalised_text, tuple(cleaned_entities))
-        if dedup_key in seen_examples:
-            stats["duplicates"] += 1
-            continue
-        seen_examples.add(dedup_key)
-
-        cleaned.append(
-            CleanedExample(text=normalised_text, entities=cleaned_entities, original=example)
-        )
-
-        if not cleaned_entities:
-            stats["no_entities"] += 1
-
-    return cleaned, stats
+            answer_text = text[start:end]
+            qa_examples.append(
+                {
+                    "id": f"{record.get('_id', index)}::{label}::{entity_index}",
+                    "question": field.question,
+                    "context": text,
+                    "answers": {"text": [answer_text], "answer_start": [start]},
+                    "label": str(label),
+                    "path": [segment.name for segment in field.path],
+                }
+            )
+    return qa_examples
 
 
-def prepare_dataset(
+def _tokenize_for_qa(
     examples: Sequence[Mapping[str, Any]],
-    label_names: Sequence[str],
-    tokenizer: CamembertTokenizerFast,
-) -> Tuple[Dataset, Dict[str, int], Dict[int, str], Dict[str, Any]]:
-    label_names = _normalise_labels(label_names)
-    label2id = {name: i for i, name in enumerate(label_names)}
-    id2label = {i: name for name, i in label2id.items()}
+    tokenizer,
+    *,
+    max_length: int,
+    stride: int,
+) -> Dataset:
+    questions = [example["question"] for example in examples]
+    contexts = [example["context"] for example in examples]
+    answers = [example["answers"] for example in examples]
 
-    cleaned_examples, stats = _clean_examples(examples, allowed_labels=label_names)
-    if stats:
-        LOGGER.info("Nettoyage des données: %s", dict(stats))
-
-    records: List[MutableMapping[str, Any]] = []
-    for cleaned in cleaned_examples:
-        text = cleaned.text
-
-        enc = tokenizer(
-            text,
-            return_offsets_mapping=True,
-            truncation=True,
-            max_length=MAX_SEQ_LENGTH,
-        )
-        offsets = enc.pop("offset_mapping")
-
-        labels = [label2id[O_LABEL]] * len(enc["input_ids"])
-        assigned_labels: List[Optional[str]] = [None] * len(offsets)
-        assigned_spans: List[Optional[Tuple[int, int]]] = [None] * len(offsets)
-        for i, (start, end) in enumerate(offsets):
-            if start == end == 0:
-                labels[i] = -100
-
-        for start, end, label in cleaned.entities:
-            saw_begin = False
-            for idx, (tok_start, tok_end) in enumerate(offsets):
-                if tok_start == tok_end == 0:
-                    continue
-                if tok_end <= start or tok_start >= end:
-                    continue
-                tag = (
-                    f"B-{label}"
-                    if not saw_begin and (tok_start <= start < tok_end)
-                    else f"I-{label}"
-                )
-                if tag in label2id:
-                    previous_label = assigned_labels[idx]
-                    previous_span = assigned_spans[idx]
-                    current_span = (start, end)
-                    if previous_label is not None and (
-                        previous_label != label or previous_span != current_span
-                    ):
-                        previous_desc = (
-                            f"{previous_label} {previous_span}"
-                            if previous_span is not None
-                            else previous_label
-                        )
-                        conflict_desc = f"{label} {current_span}"
-                        raise ValueError(
-                            "Les entités qui se chevauchent ne sont pas supportées : "
-                            f"{previous_desc} vs {conflict_desc} dans l'exemple '{text}'. "
-                            "Le modèle de token classification ne peut encoder qu'une seule étiquette par token."
-                        )
-
-                    assigned_labels[idx] = label
-                    assigned_spans[idx] = current_span
-                    labels[idx] = label2id[tag]
-                    saw_begin = True
-
-        if all(label == -100 for label in labels):
-            continue
-
-        enc["labels"] = [int(value) for value in labels]
-        records.append(enc)
-
-    if not records:
-        raise ValueError("Dataset vide après parsing")
-
-    dataset = Dataset.from_list(records)
-    metadata = {
-        "texts": [example.text for example in cleaned_examples],
-        "cleaning_stats": dict(stats),
-        "schema": {"text": "str", "entities": "List[Tuple[int, int, str]]"},
-    }
-    return dataset, label2id, id2label, metadata
-
-
-def compute_metrics(eval_pred: Tuple[np.ndarray, np.ndarray], id2label: Dict[int, str]):
-    logits, labels = eval_pred
-    predictions = np.argmax(logits, axis=-1)
-
-    true_preds: List[List[str]] = []
-    true_labels: List[List[str]] = []
-    for pred_seq, label_seq in zip(predictions, labels):
-        seq_preds: List[str] = []
-        seq_labels: List[str] = []
-        for pred, label in zip(pred_seq, label_seq):
-            if label == -100:
-                continue
-            seq_preds.append(id2label[int(pred)])
-            seq_labels.append(id2label[int(label)])
-        true_preds.append(seq_preds)
-        true_labels.append(seq_labels)
-
-    results = {
-        "precision": precision_score(true_labels, true_preds, mode="strict", scheme=IOB2),
-        "recall": recall_score(true_labels, true_preds, mode="strict", scheme=IOB2),
-        "f1": f1_score(true_labels, true_preds, mode="strict", scheme=IOB2),
-    }
-
-    try:
-        import evaluate
-        metric = evaluate.load("seqeval")
-        extra = metric.compute(predictions=true_preds, references=true_labels)
-        for k, v in extra.items():
-            if k not in results:
-                results[k] = v
-    except Exception as e:
-        LOGGER.warning("Impossible de charger le metric 'seqeval' via evaluate: %s", e)
-
-    LOGGER.debug(
-        "Rapport strict:\n%s",
-        classification_report(true_labels, true_preds, mode="strict", scheme=IOB2, digits=4),
+    tokenized = tokenizer(
+        questions,
+        contexts,
+        truncation="only_second",
+        max_length=max_length,
+        stride=stride,
+        return_overflowing_tokens=True,
+        return_offsets_mapping=True,
+        padding="max_length",
     )
 
-    return results
+    sample_mapping = tokenized.pop("overflow_to_sample_mapping")
+    offset_mapping = tokenized.pop("offset_mapping")
+
+    start_positions: List[int] = []
+    end_positions: List[int] = []
+    example_ids: List[str] = []
+
+    for i, offsets in enumerate(offset_mapping):
+        input_ids = tokenized["input_ids"][i]
+        cls_index = input_ids.index(tokenizer.cls_token_id) if tokenizer.cls_token_id in input_ids else 0
+        sequence_ids = tokenized.sequence_ids(i)
+        sample_index = sample_mapping[i]
+        answer = answers[sample_index]
+        example_ids.append(examples[sample_index]["id"])
+
+        if not answer["text"]:
+            start_positions.append(cls_index)
+            end_positions.append(cls_index)
+            continue
+
+        start_char = answer["answer_start"][0]
+        answer_text = answer["text"][0]
+        end_char = start_char + len(answer_text)
+
+        token_start_index = 0
+        while token_start_index < len(sequence_ids) and sequence_ids[token_start_index] != 1:
+            token_start_index += 1
+        token_end_index = len(sequence_ids) - 1
+        while token_end_index >= 0 and sequence_ids[token_end_index] != 1:
+            token_end_index -= 1
+
+        if (
+            token_start_index >= len(offsets)
+            or token_end_index < 0
+            or offsets[token_start_index][0] > start_char
+            or offsets[token_end_index][1] < end_char
+        ):
+            start_positions.append(cls_index)
+            end_positions.append(cls_index)
+            continue
+
+        while (
+            token_start_index < len(offsets)
+            and offsets[token_start_index][0] <= start_char
+        ):
+            token_start_index += 1
+        start_positions.append(token_start_index - 1)
+
+        while offsets[token_end_index][1] >= end_char and token_end_index >= 0:
+            token_end_index -= 1
+        end_positions.append(token_end_index + 1)
+
+    tokenized["start_positions"] = start_positions
+    tokenized["end_positions"] = end_positions
+    tokenized["example_id"] = example_ids
+    return Dataset.from_dict(tokenized)
 
 
-def _collect_label_stats(dataset: Dataset) -> Counter:
-    counter = Counter()
-    sample_size = min(50, len(dataset))
-    if sample_size:
-        for record in dataset.select(range(sample_size)):
-            counter.update(record["labels"])
-    return counter
+def prepare_qa_dataset(
+    dataset: Sequence[Mapping[str, Any]],
+    *,
+    schema: DocumentSchema,
+    tokenizer,
+    max_length: Optional[int] = None,
+    doc_stride: Optional[int] = None,
+) -> Tuple[Dataset, Dict[str, Any]]:
+    qa_examples = build_qa_examples(dataset, schema)
+    if not qa_examples:
+        raise ValueError("Dataset vide: aucun exemple question/réponse généré")
+    max_len = max_length or MAX_SEQ_LENGTH
+    stride = doc_stride or DOC_STRIDE
+    tokenized = _tokenize_for_qa(qa_examples, tokenizer, max_length=max_len, stride=stride)
+    metadata = {
+        "example_count": len(qa_examples),
+        "schema": schema.as_mapping(),
+        "vocabulary": schema.vocabulary,
+    }
+    return tokenized, metadata
 
 
 def trainer(
@@ -347,486 +526,89 @@ def trainer(
     model: Mapping[str, Any],
     *,
     parameters: Optional[Mapping[str, Any]] = None,
-    eval_dataset: Optional[Dataset] = None,
+    eval_dataset: Optional[Sequence[Mapping[str, Any]]] = None,
     version: Optional[str] = None,
 ) -> Trainer:
     if not dataset:
         raise ValueError("Dataset vide: aucune donnée à entraîner")
 
-    parameters = parameters or {}
-    label_names = model.get("labels") or []
-    model_reference = model.get("reference", "model")
-    resolved_version = version or model.get("version", "1.0")
+    parameters = dict(parameters or {})
+    mapper = model.get("mapper")
+    if not isinstance(mapper, Mapping):
+        raise ValueError("Le modèle doit fournir un mapper de champs")
 
-    tokenizer = CamembertTokenizerFast.from_pretrained(MODEL_NAME)
-    train_ds, label2id, id2label, metadata = prepare_dataset(dataset, label_names, tokenizer)
+    language = str(parameters.get("language", "fr"))
+    schema = DocumentSchema.from_mapping(mapper, language=language)
 
-    LOGGER.info(
-        "Schéma dataset: %s", metadata.get("schema", {"text": "str", "entities": "list"})
+    base_model = parameters.get("base_model") or MODEL_NAME
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+
+    train_dataset, metadata = prepare_qa_dataset(
+        dataset,
+        schema=schema,
+        tokenizer=tokenizer,
+        max_length=parameters.get("max_length"),
+        doc_stride=parameters.get("doc_stride"),
     )
 
-    texts_for_pretraining = metadata.get("texts") or []
-
-    LOGGER.info(
-        "Dataset prêt: %s exemples, %s étiquettes",
-        len(train_ds),
-        len(label2id),
-    )
-
-    eval_ratio = _ensure_float(parameters.get("eval_ratio"), 0.2)
-    if eval_dataset is None and 0.0 < eval_ratio < 0.5 and len(train_ds) > 10:
-        split_seed = _ensure_int(parameters.get("seed"), 42)
-        LOGGER.info(
-            "Découpage automatique du dataset: %.0f%% pour l'évaluation",
-            eval_ratio * 100,
+    if eval_dataset:
+        eval_encoded, _ = prepare_qa_dataset(
+            eval_dataset,
+            schema=schema,
+            tokenizer=tokenizer,
+            max_length=parameters.get("max_length"),
+            doc_stride=parameters.get("doc_stride"),
         )
-        splitted = train_ds.train_test_split(test_size=eval_ratio, seed=split_seed)
-        train_ds = splitted["train"]
-        eval_dataset = splitted["test"]
+    else:
+        eval_encoded = None
 
-    output_dir = Path("sardine.agents") / model_reference / resolved_version
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = parameters.get("output_dir", "sardine.agents/tmp")
 
-    domain_pretraining_path = run_domain_adaptive_pretraining(
-        texts_for_pretraining,
-        tokenizer,
+    training_args = TrainingArguments(
         output_dir=output_dir,
-        parameters=parameters.get("continued_pretraining"),
-    )
-
-    base_model_path = domain_pretraining_path or MODEL_NAME
-
-    ner_model = CamembertForTokenClassification.from_pretrained(
-        base_model_path,
-        num_labels=len(label2id),
-        id2label=id2label,
-        label2id=label2id,
-    )
-
-    ner_model = maybe_apply_peft(ner_model, parameters.get("peft"))
-
-    collator = DataCollatorForTokenClassification(tokenizer)
-
-    use_fp16 = _ensure_bool(parameters.get("fp16", False)) and torch.cuda.is_available()
-    if parameters.get("fp16") and not torch.cuda.is_available():
-        LOGGER.warning("fp16 demandé mais CUDA indisponible -> désactivation")
-
-    logging_dir = Path("logs") / model_reference / resolved_version
-    logging_dir.mkdir(parents=True, exist_ok=True)
-
-    warmup_ratio = _ensure_float(parameters.get("warmup_ratio"), 0.0)
-    warmup_steps = _ensure_int(parameters.get("warmup_steps"), 0)
-    lr_scheduler_type = _resolve_scheduler_type(parameters.get("lr_scheduler_type"))
-
-    args = TrainingArguments(
-        output_dir=str(output_dir),
-        learning_rate=_ensure_float(parameters.get("learning_rate"), 5e-5),
-        per_device_train_batch_size=_ensure_int(parameters.get("batch_size"), 16),
-        num_train_epochs=_ensure_float(parameters.get("epochs"), 5),
-        weight_decay=_ensure_float(parameters.get("weight_decay"), 0.01),
+        per_device_train_batch_size=int(parameters.get("batch_size", 2)),
+        num_train_epochs=float(parameters.get("epochs", 3)),
+        learning_rate=float(parameters.get("learning_rate", 3e-5)),
+        logging_steps=int(parameters.get("logging_steps", 10)),
+        evaluation_strategy="no" if eval_encoded is None else "epoch",
+        save_total_limit=int(parameters.get("save_total_limit", 2)),
         save_strategy="epoch",
-        evaluation_strategy=(
-            "no"
-            if eval_dataset is None
-            else str(parameters.get("eval_strategy", "epoch"))
-        ),
-        logging_dir=str(logging_dir),
-        logging_steps=_ensure_int(parameters.get("logging_steps", 10), 10),
-        fp16=use_fp16,
-        gradient_accumulation_steps=_ensure_int(parameters.get("grad_accum"), 1),
-        group_by_length=True,
-        dataloader_pin_memory=False,
-        warmup_ratio=warmup_ratio,
-        warmup_steps=warmup_steps,
-        lr_scheduler_type=lr_scheduler_type,
-        load_best_model_at_end=_ensure_bool(
-            parameters.get("load_best_model"), eval_dataset is not None
-        ),
-        metric_for_best_model=parameters.get("metric_for_best_model", "f1"),
-        greater_is_better=_ensure_bool(parameters.get("greater_is_better"), True),
-        save_total_limit=_ensure_int(parameters.get("save_total_limit"), 2),
+        fp16=bool(parameters.get("fp16", False)),
     )
 
-    label_stats = _collect_label_stats(train_ds)
-    kept = sum(value for key, value in label_stats.items() if key != -100)
-    LOGGER.info("Premiers comptes d'étiquettes (50 échantillons): %s", dict(label_stats))
-    LOGGER.info("Tokens conservés: %s", kept)
+    qa_model = AutoModelForQuestionAnswering.from_pretrained(base_model)
+
+    collator = DataCollatorWithPadding(tokenizer)
 
     trainer_instance = Trainer(
-        model=ner_model,
-        args=args,
-        train_dataset=train_ds,
-        eval_dataset=eval_dataset,
+        model=qa_model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_encoded,
         tokenizer=tokenizer,
         data_collator=collator,
-        compute_metrics=(
-            None
-            if eval_dataset is None
-            else (lambda predictions: compute_metrics(predictions, id2label))
-        ),
     )
 
-    if eval_dataset is not None and _ensure_bool(parameters.get("early_stopping"), False):
-        patience = _ensure_int(parameters.get("early_stopping_patience"), 2)
-        threshold = _ensure_float(parameters.get("early_stopping_threshold"), 0.0)
-        trainer_instance.add_callback(
-            EarlyStoppingCallback(
-                early_stopping_patience=patience,
-                early_stopping_threshold=threshold,
-            )
-        )
-
-    mongo_uri = os.getenv("MONGO_URI")
-    dataset_id = dataset[0].get("dataset") if dataset else None
-    callback: Optional[MongoTrainLogger] = None
-    if mongo_uri and dataset_id:
-        callback = MongoTrainLogger(
-            mongo_uri=mongo_uri,
-            dataset=str(dataset_id),
-            model=model.get("name", model_reference),
-            version=resolved_version,
-        )
-        trainer_instance.add_callback(callback)
+    LOGGER.info(
+        "Entraînement LayoutLM: %s exemples, vocabulaire=%s",
+        metadata["example_count"],
+        len(metadata["vocabulary"]),
+    )
 
     trainer_instance.train()
-    trainer_instance.save_model(str(output_dir))
-    tokenizer.save_pretrained(str(output_dir))
-
-    if eval_dataset is not None:
-        threshold = calibrate_probability_threshold(
-            trainer_instance,
-            eval_dataset,
-            id2label,
-            output_dir=output_dir,
-            parameters=parameters.get("thresholds"),
-        )
-        if threshold is not None:
-            LOGGER.info("Seuil de probabilité calibré: %.3f", threshold)
-
-    quantized_dir = maybe_quantize_model(
-        trainer_instance.model,
-        parameters.get("quantization"),
-        output_dir=output_dir,
-    )
-    if quantized_dir:
-        LOGGER.info("Modèle quantifié enregistré dans %s", quantized_dir)
-
-    run_active_learning_loop(
-        trainer_instance,
-        tokenizer,
-        parameters.get("active_learning"),
-        output_dir=output_dir,
-    )
-
-    if callback is not None:
-        callback.close()
+    trainer_instance.save_model(output_dir)
+    tokenizer.save_pretrained(output_dir)
 
     return trainer_instance
 
 
-def run_domain_adaptive_pretraining(
-    texts: Sequence[str],
-    tokenizer: CamembertTokenizerFast,
-    *,
-    output_dir: Path,
-    parameters: Optional[Mapping[str, Any]],
-) -> Optional[str]:
-    if parameters is None:
-        return None
+__all__ = [
+    "DocumentSchema",
+    "FieldPrediction",
+    "FieldSpec",
+    "PathSegment",
+    "build_qa_examples",
+    "prepare_qa_dataset",
+    "trainer",
+]
 
-    if isinstance(parameters, bool):
-        enabled = parameters
-        config: Mapping[str, Any] = {}
-    else:
-        enabled = _ensure_bool(parameters.get("enabled", True), True)
-        config = parameters
-
-    if not enabled:
-        LOGGER.info("Pré-entraînement continu désactivé")
-        return None
-
-    unique_texts = [text for text in dict.fromkeys(texts) if text]
-    min_samples = _ensure_int(config.get("min_samples", 50), 50)
-    if len(unique_texts) < min_samples:
-        LOGGER.info(
-            "Pas assez d'exemples (%s) pour le pré-entraînement (min=%s)",
-            len(unique_texts),
-            min_samples,
-        )
-        return None
-
-    pretrain_dir = output_dir / "continued-pretraining"
-    pretrain_dir.mkdir(parents=True, exist_ok=True)
-
-    LOGGER.info(
-        "Lancement du pré-entraînement continu (%s échantillons)", len(unique_texts)
-    )
-
-    corpus = Dataset.from_dict({"text": unique_texts})
-    max_samples = _ensure_int(config.get("max_samples", 5000), 5000)
-    if len(corpus) > max_samples:
-        corpus = corpus.shuffle(seed=_ensure_int(config.get("seed"), 42))
-        corpus = corpus.select(range(max_samples))
-
-    def tokenize(batch: Mapping[str, List[str]]):
-        return tokenizer(
-            batch["text"],
-            truncation=True,
-            max_length=MAX_SEQ_LENGTH,
-            return_special_tokens_mask=True,
-        )
-
-    tokenized = corpus.map(tokenize, batched=True, remove_columns=["text"])
-
-    mlm_model = CamembertForMaskedLM.from_pretrained(MODEL_NAME)
-    collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm_probability=_ensure_float(config.get("mlm_probability", 0.15), 0.15),
-    )
-
-    args = TrainingArguments(
-        output_dir=str(pretrain_dir),
-        per_device_train_batch_size=_ensure_int(config.get("batch_size", 16), 16),
-        learning_rate=_ensure_float(config.get("learning_rate", 5e-5), 5e-5),
-        num_train_epochs=_ensure_float(config.get("epochs", 1.0), 1.0),
-        weight_decay=_ensure_float(config.get("weight_decay", 0.01), 0.01),
-        logging_steps=_ensure_int(config.get("logging_steps", 20), 20),
-        save_strategy="no",
-        warmup_steps=_ensure_int(config.get("warmup_steps", 0), 0),
-        warmup_ratio=_ensure_float(config.get("warmup_ratio", 0.0), 0.0),
-        max_steps=_ensure_int(config.get("max_steps", -1), -1),
-        dataloader_pin_memory=False,
-        report_to=[],
-    )
-
-    mlm_trainer = Trainer(
-        model=mlm_model,
-        args=args,
-        train_dataset=tokenized,
-        data_collator=collator,
-    )
-
-    mlm_trainer.train()
-    mlm_trainer.save_model(str(pretrain_dir))
-
-    return str(pretrain_dir)
-
-
-def maybe_apply_peft(
-    model: CamembertForTokenClassification,
-    config: Optional[Mapping[str, Any]],
-) -> CamembertForTokenClassification:
-    if not config:
-        return model
-
-    if not PEFT_AVAILABLE:
-        LOGGER.warning("PEFT demandé mais dépendance introuvable")
-        return model
-
-    enabled = _ensure_bool(config.get("enabled", True), True)
-    if not enabled:
-        return model
-
-    lora_config = LoraConfig(
-        task_type=TaskType.TOKEN_CLS,
-        inference_mode=False,
-        r=_ensure_int(config.get("r", 8), 8),
-        lora_alpha=_ensure_float(config.get("alpha", 16.0), 16.0),
-        lora_dropout=_ensure_float(config.get("dropout", 0.1), 0.1),
-        target_modules=config.get("target_modules", ["query", "value"]),
-    )
-
-    LOGGER.info(
-        "Activation du mode PEFT (LoRA): r=%s alpha=%s dropout=%.2f",
-        lora_config.r,
-        lora_config.lora_alpha,
-        lora_config.lora_dropout,
-    )
-
-    peft_model = get_peft_model(model, lora_config)
-    peft_model.print_trainable_parameters()
-    return peft_model
-
-
-def calibrate_probability_threshold(
-    trainer: Trainer,
-    eval_dataset: Dataset,
-    id2label: Mapping[int, str],
-    *,
-    output_dir: Path,
-    parameters: Optional[Mapping[str, Any]],
-) -> Optional[float]:
-    if parameters is None:
-        enabled = True
-        config: Mapping[str, Any] = {}
-    elif isinstance(parameters, bool):
-        enabled = parameters
-        config = {}
-    else:
-        enabled = _ensure_bool(parameters.get("enabled", True), True)
-        config = parameters
-
-    if not enabled:
-        return None
-
-    LOGGER.info("Calibration du seuil de décision sur l'ensemble d'évaluation")
-    prediction_output = trainer.predict(eval_dataset)
-    logits = prediction_output.predictions
-    labels = prediction_output.label_ids
-
-    probabilities = torch.softmax(torch.tensor(logits), dim=-1).numpy()
-    o_label_id = next((idx for idx, name in id2label.items() if name == O_LABEL), 0)
-
-    if config and "search_space" in config:
-        search_space = [float(val) for val in config["search_space"]]
-    else:
-        search_space = [round(x, 2) for x in np.linspace(0.3, 0.9, 13)]
-
-    best_threshold = 0.5
-    best_score = -1.0
-
-    for threshold in search_space:
-        predictions: List[List[int]] = []
-        true_labels: List[List[int]] = []
-        for prob_seq, label_seq in zip(probabilities, labels):
-            seq_pred: List[int] = []
-            seq_true: List[int] = []
-            for probs, true_label in zip(prob_seq, label_seq):
-                if true_label == -100:
-                    continue
-                best_label = int(np.argmax(probs))
-                best_prob = float(np.max(probs))
-                if best_prob < threshold:
-                    seq_pred.append(o_label_id)
-                else:
-                    seq_pred.append(best_label)
-                seq_true.append(int(true_label))
-            predictions.append(seq_pred)
-            true_labels.append(seq_true)
-
-        mapped_preds = [[id2label[idx] for idx in seq] for seq in predictions]
-        mapped_labels = [[id2label[idx] for idx in seq] for seq in true_labels]
-        score = f1_score(mapped_labels, mapped_preds, mode="strict", scheme=IOB2)
-        if score > best_score:
-            best_score = score
-            best_threshold = threshold
-
-    threshold_file = output_dir / "probability_threshold.json"
-    threshold_file.write_text(
-        json.dumps({"threshold": best_threshold}, indent=2), encoding="utf-8"
-    )
-
-    return best_threshold
-
-
-def maybe_quantize_model(
-    model: CamembertForTokenClassification,
-    config: Optional[Mapping[str, Any]],
-    *,
-    output_dir: Path,
-) -> Optional[Path]:
-    if not config:
-        return None
-
-    if isinstance(config, bool):
-        enabled = config
-        dtype_name = "qint8"
-    else:
-        enabled = _ensure_bool(config.get("enabled", True), True)
-        dtype_name = str(config.get("dtype", "qint8"))
-
-    if not enabled:
-        return None
-
-    dtype_map = {
-        "qint8": torch.qint8,
-        "float16": torch.float16,
-    }
-    dtype = dtype_map.get(dtype_name, torch.qint8)
-
-    LOGGER.info("Quantification dynamique du modèle (%s)", dtype_name)
-    quantized = torch.quantization.quantize_dynamic(
-        model.cpu(), {torch.nn.Linear}, dtype=dtype
-    )
-
-    quant_dir = output_dir / "quantized"
-    quant_dir.mkdir(parents=True, exist_ok=True)
-    quantized.save_pretrained(str(quant_dir))
-    return quant_dir
-
-
-def run_active_learning_loop(
-    trainer: Trainer,
-    tokenizer: CamembertTokenizerFast,
-    config: Optional[Mapping[str, Any]],
-    *,
-    output_dir: Path,
-) -> None:
-    if not config:
-        return
-
-    pool = config.get("pool") if isinstance(config, Mapping) else None
-    if not pool:
-        LOGGER.info("Aucun pool de données fourni pour l'active learning")
-        return
-
-    selection_size = _ensure_int(config.get("selection_size", 25), 25)
-
-    encodings: List[Dict[str, Any]] = []
-    texts: List[str] = []
-    original_examples: List[Mapping[str, Any]] = []
-    for sample in pool:
-        text = (sample.get("text") or "").strip()
-        if not text:
-            continue
-        encoded = tokenizer(
-            text,
-            truncation=True,
-            max_length=MAX_SEQ_LENGTH,
-        )
-        encodings.append(encoded)
-        texts.append(text)
-        original_examples.append(sample)
-
-    if not encodings:
-        LOGGER.info("Pool d'active learning vide après nettoyage")
-        return
-
-    dataset = Dataset.from_list(encodings)
-    prediction_output = trainer.predict(dataset)
-    probabilities = torch.softmax(
-        torch.tensor(prediction_output.predictions), dim=-1
-    ).numpy()
-
-    candidates: List[Dict[str, Any]] = []
-    for text, probs, enc, original in zip(texts, probabilities, encodings, original_examples):
-        mask = np.array(enc.get("attention_mask", []))
-        valid_probs = probs[mask == 1]
-        if valid_probs.size == 0:
-            continue
-        token_uncertainty = 1.0 - valid_probs.max(axis=-1)
-        candidates.append(
-            {
-                "text": text,
-                "uncertainty": float(mean(token_uncertainty)),
-                "max_uncertainty": float(np.max(token_uncertainty)),
-                "source": _sanitize_for_json({k: v for k, v in original.items() if k != "text"}),
-            }
-        )
-
-    if not candidates:
-        LOGGER.info("Impossible de calculer des incertitudes pour l'active learning")
-        return
-
-    candidates.sort(key=lambda item: item["uncertainty"], reverse=True)
-    selected = candidates[:selection_size]
-
-    target_file = output_dir / "active_learning_candidates.json"
-    target_file.write_text(
-        json.dumps(selected, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    LOGGER.info(
-        "Top %s échantillons d'active learning sauvegardés dans %s",
-        len(selected),
-        target_file,
-    )
