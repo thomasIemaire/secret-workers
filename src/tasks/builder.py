@@ -406,8 +406,10 @@ class DatasetBuilder:
         last_index = 0
 
         for match in PLACEHOLDER_PATTERN.finditer(template):
-            parts.append(template[last_index : match.start()])
-            cursor += len(template[last_index : match.start()])
+            literal = template[last_index : match.start()]
+            if literal:
+                parts.append(literal)
+                cursor += len(literal)
 
             key = match.group("key")
             value_info = resolve_value(key)
@@ -416,23 +418,26 @@ class DatasetBuilder:
             requirements_met = True if attr is None else attr.get("requirements_met", True)
 
             start = cursor
-            if key in self.entity_keys and value and requirements_met:
-                end = start + len(value)
-                entities.append([start, end, key])
-            cursor += len(value)
+            end = start + len(value)
 
-            parts.append(value)
-            last_index = match.end()
+            if key in self.entity_keys and value and requirements_met:
+                entities.append([start, end, key])
 
             for nested_start, nested_end, nested_key in value_info.get("entities", []):
-                if nested_end <= nested_start:
+                absolute_start = start + nested_start
+                absolute_end = start + nested_end
+                if absolute_end <= absolute_start:
                     continue
                 nested_attr = attr_map.get(nested_key)
                 nested_requirements_met = (
                     True if nested_attr is None else nested_attr.get("requirements_met", True)
                 )
                 if nested_key in self.entity_keys and nested_requirements_met:
-                    entities.append([start + nested_start, start + nested_end, nested_key])
+                    entities.append([absolute_start, absolute_end, nested_key])
+
+            cursor = end
+            parts.append(value)
+            last_index = match.end()
 
         parts.append(template[last_index:])
         cursor += len(template[last_index:])

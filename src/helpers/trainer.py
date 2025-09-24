@@ -232,6 +232,8 @@ def prepare_dataset(
         offsets = enc.pop("offset_mapping")
 
         labels = [label2id[O_LABEL]] * len(enc["input_ids"])
+        assigned_labels: List[Optional[str]] = [None] * len(offsets)
+        assigned_spans: List[Optional[Tuple[int, int]]] = [None] * len(offsets)
         for i, (start, end) in enumerate(offsets):
             if start == end == 0:
                 labels[i] = -100
@@ -249,6 +251,26 @@ def prepare_dataset(
                     else f"I-{label}"
                 )
                 if tag in label2id:
+                    previous_label = assigned_labels[idx]
+                    previous_span = assigned_spans[idx]
+                    current_span = (start, end)
+                    if previous_label is not None and (
+                        previous_label != label or previous_span != current_span
+                    ):
+                        previous_desc = (
+                            f"{previous_label} {previous_span}"
+                            if previous_span is not None
+                            else previous_label
+                        )
+                        conflict_desc = f"{label} {current_span}"
+                        raise ValueError(
+                            "Les entités qui se chevauchent ne sont pas supportées : "
+                            f"{previous_desc} vs {conflict_desc} dans l'exemple '{text}'. "
+                            "Le modèle de token classification ne peut encoder qu'une seule étiquette par token."
+                        )
+
+                    assigned_labels[idx] = label
+                    assigned_spans[idx] = current_span
                     labels[idx] = label2id[tag]
                     saw_begin = True
 
@@ -293,11 +315,15 @@ def compute_metrics(eval_pred: Tuple[np.ndarray, np.ndarray], id2label: Dict[int
         "f1": f1_score(true_labels, true_preds, mode="strict", scheme=IOB2),
     }
 
-    metric = evaluate.load("seqeval")
-    seqeval_metrics = metric.compute(predictions=true_preds, references=true_labels)
-    for key, value in seqeval_metrics.items():
-        if key not in results:
-            results[key] = value
+    try:
+        import evaluate
+        metric = evaluate.load("seqeval")
+        extra = metric.compute(predictions=true_preds, references=true_labels)
+        for k, v in extra.items():
+            if k not in results:
+                results[k] = v
+    except Exception as e:
+        LOGGER.warning("Impossible de charger le metric 'seqeval' via evaluate: %s", e)
 
     LOGGER.debug(
         "Rapport strict:\n%s",
@@ -347,7 +373,7 @@ def trainer(
         len(label2id),
     )
 
-    eval_ratio = _ensure_float(parameters.get("eval_ratio"), 0.0)
+    eval_ratio = _ensure_float(parameters.get("eval_ratio"), 0.2)
     if eval_dataset is None and 0.0 < eval_ratio < 0.5 and len(train_ds) > 10:
         split_seed = _ensure_int(parameters.get("seed"), 42)
         LOGGER.info(
