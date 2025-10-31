@@ -175,8 +175,8 @@ class DatasetBuilder:
         requirement_ok = True
         if include and value not in (None, ""):
             requirement_ok = self._check_requirements(value, requirements)
-            if not requirement_ok:
-                value = ""
+            # if not requirement_ok:
+            #     value = ""
 
         return (
             {"key": key, "value": "" if value is None else value, "requirements": requirement_ok},

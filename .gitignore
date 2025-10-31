@@ -1,5 +1,6 @@
 venv/
 .venv/
+sardine.agents/*
 **/__pycache__/
 *.py[cod]
 *$py.class
